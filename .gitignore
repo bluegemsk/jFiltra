@@ -1,0 +1,16 @@
+# Build output
+*/script/bin/
+*.class
+
+# Libraries and built JARs (see README for download links)
+*/lib/*.jar
+
+# Logs
+*/logs/
+*.log
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.iml
