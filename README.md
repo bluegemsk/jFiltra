@@ -64,10 +64,10 @@ committed to git:
 | `client.paths.config` | No       | File that maps each client label to its storage directory  |
 | `socket.timeout.seconds` | No    | Seconds to wait for data from a client before closing the connection (default `30`) |
 | `header.timeout.seconds` | No    | Seconds a client has to send the transfer header: label, file name, hash and size (default `5`) |
-| `transfer.timeout.seconds` | No  | Maximum total seconds for one transfer, including processing (default `600`) |
+| `transfer.timeout.seconds` | No  | Maximum total seconds for one transfer, including processing (default `600`); raise it for large files or slow networks |
 | `max.connections`     | No       | Maximum transfers handled at the same time (default `10`)  |
 | `max.connections.per.ip` | No    | Maximum simultaneous connections from one IP address (default `4`) |
-| `max.file.size.mb`    | No       | Largest file accepted, both as sent and after decompression, from `1` to `2047` (default `512`) |
+| `max.file.size.mb`    | No       | Largest file accepted, both as sent and after decompression (default `512`) |
 
 Relative paths are resolved from the `server/` folder, because the start script
 runs the server from there. Leaving out `client.keys.path` means no keys are
@@ -77,8 +77,10 @@ Both server and client check their settings at startup. A missing required
 setting or an invalid value stops the program with a message naming the
 setting, for example `Missing required setting: server.port`.
 
-`.properties` files are read as ISO-8859-1. Write any other characters, in keys
-or paths, as `\uXXXX` escapes. For example, `ľ` becomes `\u013e`.
+Save all `.properties` files as UTF-8, so keys and paths can contain any
+characters, for example `client1=/data/účtovníctvo`. A file that isn't valid
+UTF-8 stops the program with a message saying so. Escapes such as `\u013e`
+also still work.
 
 `server/config/client_keys.properties` has one line per client, in the form
 `<client.label>=<encryption key>`. A client whose label is not listed is rejected.
@@ -198,11 +200,13 @@ echo "hello jFiltra" > /tmp/jfiltra/source1/test.txt
   its real name in one atomic step. Other programs watching the storage directory
   therefore never see a half-written file. If the server is stopped in the middle
   of a write, the leftover `.part` file is deleted the next time the server starts.
-- Each file is held in memory while it is encrypted and decrypted. On the server,
-  `max.file.size.mb` sets the largest accepted file. Give the server a Java heap
-  several times that size. No file can be larger than 2047MB. On the client, a
-  file too large for its heap is logged as an error on each poll and left in
-  place, and the other files are still sent.
+- Files are processed in small chunks, so memory use stays the same whatever the
+  file size, and there is no size limit apart from `max.file.size.mb`.
+- The client writes no temporary files. It reads each file twice: once to
+  compute its hash and the size of the data to send, and once while sending.
+  The server writes only the `.part` file in the storage directory.
+- If a file changes between the client's two reads, the client drops the
+  transfer and sends the file again on a later poll.
 
 ## Logging
 

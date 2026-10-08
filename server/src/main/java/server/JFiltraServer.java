@@ -17,6 +17,8 @@ import java.io.*;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
@@ -26,6 +28,9 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.security.DigestOutputStream;
+import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -41,6 +46,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
 import javax.crypto.Cipher;
+import javax.crypto.CipherInputStream;
 import javax.crypto.spec.SecretKeySpec;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -50,7 +56,8 @@ import org.apache.logging.log4j.Logger;
  * 
  * This server receives encrypted and compressed files from clients, processes them
  * (decrypts, uncompresses), verifies file integrity via hash validation, and stores
- * them in designated client-specific storage locations.
+ * them in designated client-specific storage locations. Files are streamed from the
+ * network straight into the storage directory, so memory use doesn't depend on file size.
  * 
  * Security features:
  * - Client-specific encryption keys
@@ -126,9 +133,8 @@ public class JFiltraServer {
             maxConnections = intProperty(config, "max.connections", 10, 1, 1000);
             maxConnectionsPerIp = intProperty(config, "max.connections.per.ip", 4, 1, 1000);
             
-            // Maximum accepted file size (default 512 MB). Files are processed in memory,
-            // so the size can't exceed 2047 MB.
-            maxFileSizeBytes = intProperty(config, "max.file.size.mb", 512, 1, 2047) * 1024L * 1024L;
+            // Maximum accepted file size (default 512 MB, at most 1 TB)
+            maxFileSizeBytes = intProperty(config, "max.file.size.mb", 512, 1, 1048576) * 1024L * 1024L;
             
             // Load client encryption keys from separate file for better security
             String clientKeysPath = config.getProperty("client.keys.path");
@@ -171,17 +177,28 @@ public class JFiltraServer {
     }
     
     /**
-     * Loads a properties file, closing it afterwards.
+     * Loads a properties file as UTF-8, so keys and paths can contain any characters.
+     * A UTF-8 byte order mark (added by some Windows editors) is ignored, and
+     * escapes such as backslash-u013e keep working.
      * 
      * @param path Path to the properties file
      * @return The loaded properties
-     * @throws IOException If the file cannot be read
+     * @throws IOException If the file cannot be read or is not valid UTF-8
      */
     private static Properties loadProperties(String path) throws IOException {
-        Properties props = new Properties();
-        try (InputStream in = new FileInputStream(path)) {
-            props.load(in);
+        byte[] bytes = Files.readAllBytes(Paths.get(path));
+        String text;
+        try {
+            text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException e) {
+            throw new IOException(path + " is not valid UTF-8; save it with UTF-8 encoding");
         }
+        if (text.startsWith("\uFEFF")) {
+            text = text.substring(1);
+        }
+        
+        Properties props = new Properties();
+        props.load(new StringReader(text));
         return props;
     }
     
@@ -407,18 +424,14 @@ public class JFiltraServer {
      * Handles an individual client connection.
      * Processes file transfers including:
      * - Reading metadata (client ID, filename, file hash, file size)
-     * - Receiving encrypted data
-     * - Decrypting and uncompressing data
+     * - Receiving, decrypting and uncompressing data in one streaming pass
      * - Verifying file integrity via hash
      * - Storing the file in client-specific directory
      * 
      * @param clientSocket The socket for the client connection
      */
     private void handleClient(Socket clientSocket) {
-        // Temporary files for this transfer; always deleted in the finally block
-        File encryptedFile = null;
-        File decryptedFile = null;
-        File uncompressedFile = null;
+        // Temporary file for this transfer; deleted in the finally block unless published
         Path partFile = null;
         DataOutputStream dos = null;
         ScheduledFuture<?> deadline = null;
@@ -434,7 +447,7 @@ public class JFiltraServer {
             deadline = scheduleClose(clientSocket, headerTimeoutSeconds, "header time limit");
             
             // Initialize data streams for communication with client
-            DataInputStream dis = new DataInputStream(clientSocket.getInputStream());
+            DataInputStream dis = new DataInputStream(new BufferedInputStream(clientSocket.getInputStream(), 65536));
             dos = new DataOutputStream(clientSocket.getOutputStream());
             
             // Read client identification label (used to determine encryption key and storage path)
@@ -473,40 +486,8 @@ public class JFiltraServer {
                 // Security error - client not authorized or missing key
                 logger.error("No encryption key found for client: " + clientLabel);
                 // Discard the upload without storing it, so the client can read the response
-                receiveBytes(dis, null, fileSize);
+                new LimitedInputStream(dis, fileSize).skipRemaining();
                 dos.writeUTF("ERROR: No encryption key found");
-                return;
-            }
-            
-            // Create temporary file to store the encrypted data
-            encryptedFile = File.createTempFile("encrypted_", ".enc");
-            
-            // Read encrypted file data from client
-            long missingBytes;
-            try (FileOutputStream fos = new FileOutputStream(encryptedFile)) {
-                missingBytes = receiveBytes(dis, fos, fileSize);
-            }
-            if (missingBytes > 0) {
-                // Client disconnected before sending the whole file
-                logger.error("Incomplete transfer of file " + originalFileName + " from client " + clientLabel
-                        + ": " + missingBytes + " bytes missing");
-                return;
-            }
-            
-            // Decrypt the file using client-specific encryption key
-            decryptedFile = decryptFile(encryptedFile, encryptionKey);
-            
-            // Uncompress the file (clients send GZIP compressed data)
-            uncompressedFile = uncompressFile(decryptedFile);
-            
-            // Calculate hash of processed file for integrity verification
-            String calculatedHash = calculateFileHash(uncompressedFile.toPath());
-            
-            // Verify file integrity by comparing hashes
-            if (!calculatedHash.equals(fileHash)) {
-                // Data integrity error - file corrupted during transfer
-                logger.error("Hash verification failed for file: " + originalFileName);
-                dos.writeUTF("ERROR: Hash verification failed");
                 return;
             }
             
@@ -527,20 +508,33 @@ public class JFiltraServer {
             if (destinationFile == null) {
                 // File name contains path components (e.g. "../") or is not allowed
                 logger.error("Rejected invalid file name: " + originalFileName + " from client: " + clientLabel);
+                new LimitedInputStream(dis, fileSize).skipRemaining();
                 dos.writeUTF("ERROR: Invalid file name");
                 return;
             }
 
-            // Never overwrite an existing file
+            // Never overwrite an existing file; no need to store the upload to decide
             if (destinationFile.exists()) {
+                new LimitedInputStream(dis, fileSize).skipRemaining();
                 respondToExistingFile(dos, destinationFile, fileHash, originalFileName, clientLabel);
                 return;
             }
             
-            // Write to a hidden temporary file in the storage directory first, so other
-            // programs never see a partially written file
+            // Receive, decrypt, decompress and hash the file in one pass, writing it to a
+            // hidden temporary file in the storage directory, so other programs never see
+            // a partially written file
             partFile = storageDir.toPath().resolve(".jfiltra-" + UUID.randomUUID() + ".part");
-            Files.copy(uncompressedFile.toPath(), partFile);
+            String calculatedHash = receiveFile(dis, fileSize, encryptionKey, partFile);
+            
+            // Verify file integrity by comparing hashes
+            if (!calculatedHash.equals(fileHash)) {
+                // Data integrity error - file corrupted during transfer
+                logger.error("Hash verification failed for file: " + originalFileName);
+                dos.writeUTF("ERROR: Hash verification failed");
+                return;
+            }
+            
+            long fileSizeReceived = Files.size(partFile);
             
             // Publish under the real name; fails if another transfer stored the name meanwhile
             if (!publishFile(partFile, destinationFile.toPath())) {
@@ -551,8 +545,6 @@ public class JFiltraServer {
             // Calculate processing duration for performance logging
             long endTime = System.currentTimeMillis();
             double duration = (endTime - startTime) / 1000.0;
-
-            long fileSizeReceived = uncompressedFile.length();
 
             // Log successful file transfer with performance metrics
             String logMessage = String.format(
@@ -583,10 +575,7 @@ public class JFiltraServer {
                 deadline.cancel(false);
             }
             
-            // Clean up temporary files on success and on every error path
-            deleteTempFile(encryptedFile);
-            deleteTempFile(decryptedFile);
-            deleteTempFile(uncompressedFile);
+            // Clean up the temporary file on every error path (after publishing it no longer exists)
             if (partFile != null) {
                 deleteTempFile(partFile.toFile());
             }
@@ -601,27 +590,66 @@ public class JFiltraServer {
     }
 
     /**
-     * Reads the given number of bytes from the client.
+     * Receives the file data from the client and writes it to the target file, decrypting,
+     * decompressing and hashing it on the way. Data is processed in small chunks, so
+     * memory use doesn't depend on the file size.
      * 
-     * @param dis The stream to read from
-     * @param out Where to write the bytes, or null to discard them
-     * @param byteCount Number of bytes to read
-     * @return Number of bytes not received because the client closed the connection early
-     * @throws IOException If reading fails or times out
+     * @param dis The stream to read the client's data from
+     * @param byteCount Number of (compressed, encrypted) bytes the client announced
+     * @param encryptionKey The client's encryption key
+     * @param target The file to write the original content to; must not exist yet
+     * @return SHA-256 hash of the received original content
+     * @throws IOException If receiving fails, the data is invalid, or the size limit is exceeded
+     * @throws GeneralSecurityException If the cipher cannot be set up
      */
-    private long receiveBytes(DataInputStream dis, OutputStream out, long byteCount) throws IOException {
-        byte[] buffer = new byte[4096];
-        long remaining = byteCount;
-        int bytesRead;
+    private String receiveFile(DataInputStream dis, long byteCount, String encryptionKey, Path target)
+            throws IOException, GeneralSecurityException {
+        // Generate a 32-byte (256-bit) key using SHA-256 hash of the provided key
+        MessageDigest keyDigest = MessageDigest.getInstance("SHA-256");
+        byte[] keyBytes = keyDigest.digest(encryptionKey.getBytes(StandardCharsets.UTF_8));
         
-        // Read data in chunks until all bytes received
-        while (remaining > 0 && (bytesRead = dis.read(buffer, 0, (int) Math.min(buffer.length, remaining))) != -1) {
-            if (out != null) {
-                out.write(buffer, 0, bytesRead);
+        // Initialize AES cipher for decryption
+        SecretKeySpec secretKey = new SecretKeySpec(keyBytes, "AES");
+        Cipher cipher = Cipher.getInstance("AES");
+        cipher.init(Cipher.DECRYPT_MODE, secretKey);
+        
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        LimitedInputStream body = new LimitedInputStream(dis, byteCount);
+        
+        try (InputStream gzis = new GZIPInputStream(new CipherInputStream(body, cipher), 8192);
+             OutputStream out = new DigestOutputStream(
+                     new BufferedOutputStream(Files.newOutputStream(target, StandardOpenOption.CREATE_NEW)), digest)) {
+
+            // Decompress data in chunks, stopping if the output exceeds the size limit
+            byte[] buffer = new byte[8192];
+            int len;
+            long totalBytes = 0;
+            while ((len = gzis.read(buffer)) != -1) {
+                totalBytes += len;
+                if (totalBytes > maxFileSizeBytes) {
+                    throw new IOException("Uncompressed size exceeds limit of " + maxFileSizeBytes + " bytes");
+                }
+                out.write(buffer, 0, len);
             }
-            remaining -= bytesRead;
+        } catch (IOException e) {
+            // Invalid data (e.g. wrong key) is detected early. Read the rest of the upload anyway,
+            // so the client receives the error reply instead of a broken connection.
+            try {
+                body.skipRemaining();
+            } catch (IOException ignored) {
+                // Connection broken or timed out - the client can't be answered anyway
+            }
+            throw e;
         }
-        return remaining;
+
+        // Read any bytes the decompressor didn't need, so they aren't mistaken for the next message
+        body.skipRemaining();
+        if (body.remaining() > 0) {
+            // Client disconnected before sending the whole file
+            throw new EOFException("Incomplete transfer: " + body.remaining() + " bytes missing");
+        }
+        
+        return toHex(digest.digest());
     }
 
     /**
@@ -760,85 +788,6 @@ public class JFiltraServer {
     }
 
     /**
-     * Decrypts a file using AES encryption with the provided key.
-     * 
-     * @param encryptedFile The file containing encrypted data
-     * @param encryptionKey The key to use for decryption
-     * @return A temporary file containing the decrypted data
-     * @throws Exception If decryption fails
-     */
-    private File decryptFile(File encryptedFile, String encryptionKey) throws Exception {
-        // Create temporary file for decrypted data
-        File decryptedFile = File.createTempFile("decrypted_", ".tmp");
-        
-        // Generate a 32-byte (256-bit) key using SHA-256 hash of the provided key
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        byte[] keyBytes = digest.digest(encryptionKey.getBytes(StandardCharsets.UTF_8));
-        
-        // Initialize AES cipher for decryption
-        SecretKeySpec secretKey = new SecretKeySpec(keyBytes, "AES");
-        Cipher cipher = Cipher.getInstance("AES");
-        cipher.init(Cipher.DECRYPT_MODE, secretKey);
-        
-        // Perform decryption operation
-        try (FileInputStream fis = new FileInputStream(encryptedFile);
-             FileOutputStream fos = new FileOutputStream(decryptedFile)) {
-            
-            // Read all encrypted bytes
-            byte[] inputBytes = new byte[(int) encryptedFile.length()];
-            fis.read(inputBytes);
-            
-            // Decrypt and write to output file
-            byte[] outputBytes = cipher.doFinal(inputBytes);
-            fos.write(outputBytes);
-        } catch (Exception e) {
-            // Don't leave the temporary file behind if decryption fails (e.g. wrong key)
-            deleteTempFile(decryptedFile);
-            throw e;
-        }
-        
-        logger.info("File decrypted successfully");
-        return decryptedFile;
-    }
-
-    /**
-     * Uncompresses a GZIP compressed file.
-     * 
-     * @param compressedFile The file containing GZIP compressed data
-     * @return A temporary file containing the uncompressed data
-     * @throws IOException If decompression fails
-     */
-    private File uncompressFile(File compressedFile) throws IOException {
-        // Create temporary file for uncompressed data
-        File uncompressedFile = File.createTempFile("uncompressed_", ".bin");
-        
-        // Set up GZIP input stream for decompression
-        try (FileInputStream fis = new FileInputStream(compressedFile);
-             GZIPInputStream gzis = new GZIPInputStream(fis);
-             FileOutputStream fos = new FileOutputStream(uncompressedFile)) {
-            
-            // Decompress data in chunks, stopping if the output exceeds the size limit
-            byte[] buffer = new byte[1024];
-            int len;
-            long totalBytes = 0;
-            while ((len = gzis.read(buffer)) != -1) {
-                totalBytes += len;
-                if (totalBytes > maxFileSizeBytes) {
-                    throw new IOException("Uncompressed size exceeds limit of " + maxFileSizeBytes + " bytes");
-                }
-                fos.write(buffer, 0, len);
-            }
-        } catch (IOException e) {
-            // Don't leave the temporary file behind if the data is not valid GZIP
-            deleteTempFile(uncompressedFile);
-            throw e;
-        }
-        
-        logger.info("File uncompressed successfully");
-        return uncompressedFile;
-    }
-
-    /**
      * Calculates SHA-256 hash of a file for integrity verification.
      * 
      * @param filePath Path to the file to hash
@@ -928,4 +877,76 @@ public class JFiltraServer {
         // Start the server
         server.start();
     }
-} 
+
+    /**
+     * Reads at most a fixed number of bytes from the client. It never closes the
+     * underlying stream, so the socket stays open for the reply.
+     */
+    private static class LimitedInputStream extends FilterInputStream {
+        private long remaining;
+        
+        LimitedInputStream(InputStream in, long limit) {
+            super(in);
+            this.remaining = limit;
+        }
+        
+        @Override
+        public int read() throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int b = in.read();
+            if (b >= 0) {
+                remaining--;
+            }
+            return b;
+        }
+        
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int n = in.read(b, off, (int) Math.min(len, remaining));
+            if (n > 0) {
+                remaining -= n;
+            }
+            return n;
+        }
+        
+        @Override
+        public long skip(long n) throws IOException {
+            long skipped = in.skip(Math.min(n, remaining));
+            remaining -= skipped;
+            return skipped;
+        }
+        
+        @Override
+        public int available() throws IOException {
+            return (int) Math.min(in.available(), remaining);
+        }
+        
+        @Override
+        public boolean markSupported() {
+            return false;
+        }
+        
+        @Override
+        public void close() {
+            // Keep the socket open
+        }
+        
+        /** Number of announced bytes not read yet. */
+        long remaining() {
+            return remaining;
+        }
+        
+        /** Reads and discards the rest of the announced bytes, or until the client disconnects. */
+        void skipRemaining() throws IOException {
+            byte[] buffer = new byte[8192];
+            while (remaining > 0 && read(buffer, 0, buffer.length) != -1) {
+                // Discard
+            }
+        }
+    }
+}

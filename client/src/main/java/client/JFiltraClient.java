@@ -16,9 +16,13 @@ package client;
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.DigestInputStream;
+import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -29,6 +33,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import java.util.zip.GZIPOutputStream;
 import javax.crypto.Cipher;
+import javax.crypto.CipherOutputStream;
 import javax.crypto.spec.SecretKeySpec;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -37,6 +42,8 @@ import org.apache.logging.log4j.Logger;
  * JFiltraClient - A client application that monitors directories for files,
  * processes them (compresses and encrypts), and sends them to a remote server.
  * The client runs on a scheduled interval and removes files after successful transfer.
+ * Files are streamed in small chunks, so memory use doesn't depend on file size,
+ * and no temporary files are written.
  */
 public class JFiltraClient {
     // Initialize logger for application logging
@@ -88,10 +95,7 @@ public class JFiltraClient {
     public JFiltraClient(String configPath) {
         try {
             // Load configuration
-            config = new Properties();
-            try (InputStream in = new FileInputStream(configPath)) {
-                config.load(in);
-            }
+            config = loadProperties(configPath);
             
             // Parse configuration
             // Trim each entry and skip empty ones, so "dir1, dir2" works as expected
@@ -139,6 +143,32 @@ public class JFiltraClient {
             logger.error("Error loading configuration: " + e.getMessage());
             System.exit(1);
         }
+    }
+    
+    /**
+     * Loads a properties file as UTF-8, so keys and paths can contain any characters.
+     * A UTF-8 byte order mark (added by some Windows editors) is ignored, and
+     * escapes such as backslash-u013e keep working.
+     * 
+     * @param path Path to the properties file
+     * @return The loaded properties
+     * @throws IOException If the file cannot be read or is not valid UTF-8
+     */
+    private static Properties loadProperties(String path) throws IOException {
+        byte[] bytes = Files.readAllBytes(Paths.get(path));
+        String text;
+        try {
+            text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException e) {
+            throw new IOException(path + " is not valid UTF-8; save it with UTF-8 encoding");
+        }
+        if (text.startsWith("\uFEFF")) {
+            text = text.substring(1);
+        }
+        
+        Properties props = new Properties();
+        props.load(new StringReader(text));
+        return props;
     }
     
     /**
@@ -309,22 +339,17 @@ public class JFiltraClient {
     private void processFile(Path filePath, String snapshot) {
         String fileName = filePath.getFileName().toString();
         logger.info("Processing file: " + fileName);
-       
-        File compressedFile = null;
-        File encryptedFile = null;
         
         try {
-            // Calculate file hash
-            String fileHash = calculateFileHash(filePath);
+            // First pass: hash the file and measure its compressed, encrypted size, which
+            // the server needs before the data. Nothing is stored, so no temp files are needed.
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            CountingOutputStream sizeCounter = new CountingOutputStream(new DiscardingOutputStream());
+            writeEncrypted(filePath, sizeCounter, digest);
+            String fileHash = toHex(digest.digest());
             
-            // Compress the file
-            compressedFile = compressFile(filePath.toFile());
-            
-            // Encrypt the file
-            encryptedFile = encryptFile(compressedFile);
-            
-            // Send the file to server
-            boolean sent = sendFileToServer(encryptedFile, fileHash, fileName);
+            // Second pass: compress, encrypt and send the file straight to the server
+            boolean sent = sendFileToServer(filePath, fileHash, sizeCounter.count, fileName);
             
             if (sent) {
                 
@@ -342,112 +367,78 @@ public class JFiltraClient {
               
             }
         } catch (Exception | OutOfMemoryError e) {
-            // OutOfMemoryError is caught too (e.g. a file too large for the heap), so one
-            // file cannot stop the others from being processed
+            // OutOfMemoryError is caught too, so one file cannot stop the others from being processed
             logger.error("Error processing file " + fileName + ": " + e, e);
            
-        } finally {
-            // Clean up temporary files on success and on every error path
-            if (compressedFile != null) compressedFile.delete();
-            if (encryptedFile != null) encryptedFile.delete();
         }
     }
 
     /**
-     * Calculates a SHA-256 hash of the file contents
-     * Used for file integrity verification
+     * Compresses (GZIP) and encrypts (AES) a file in small chunks and writes the result
+     * to the given stream. Memory use doesn't depend on the file size.
      * 
-     * @param filePath Path to the file to hash
-     * @return Hexadecimal string representation of the file hash
-     * @throws Exception If hashing fails
+     * @param filePath The file to read
+     * @param out Where to write the compressed, encrypted data; it is not closed
+     * @param digest If not null, updated with the file's original content for hashing
+     * @throws IOException If reading or writing fails
+     * @throws GeneralSecurityException If the cipher cannot be set up
      */
-    private String calculateFileHash(Path filePath) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        byte[] fileBytes = Files.readAllBytes(filePath);
-        byte[] hashBytes = digest.digest(fileBytes);
-        
-        StringBuilder hexString = new StringBuilder();
-        for (byte hashByte : hashBytes) {
-            String hex = Integer.toHexString(0xff & hashByte);
-            if (hex.length() == 1) hexString.append('0');
-            hexString.append(hex);
-        }
-        
-        return hexString.toString();
-    }
-
-    /**
-     * Compresses a file using GZIP compression
-     * 
-     * @param inputFile The file to compress
-     * @return A temporary file containing the compressed data
-     * @throws IOException If compression fails
-     */
-    private File compressFile(File inputFile) throws IOException {
-        File compressedFile = File.createTempFile("compressed_", ".gz");
-        
-        try (FileInputStream fis = new FileInputStream(inputFile);
-             FileOutputStream fos = new FileOutputStream(compressedFile);
-             GZIPOutputStream gzos = new GZIPOutputStream(fos)) {
-            
-            byte[] buffer = new byte[1024];
-            int len;
-            while ((len = fis.read(buffer)) != -1) {
-                gzos.write(buffer, 0, len);
-            }
-        }
-        
-        return compressedFile;
-    }
-
-    /**
-     * Encrypts a file using AES encryption with the configured key
-     * 
-     * @param inputFile The file to encrypt
-     * @return A temporary file containing the encrypted data
-     * @throws Exception If encryption fails
-     */
-    private File encryptFile(File inputFile) throws Exception {
-        File encryptedFile = File.createTempFile("encrypted_", ".tmp");
-        
+    private void writeEncrypted(Path filePath, OutputStream out, MessageDigest digest)
+            throws IOException, GeneralSecurityException {
         // Generate a 32-byte (256-bit) key using SHA-256
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        byte[] keyBytes = digest.digest(encryptionKey.getBytes(StandardCharsets.UTF_8));
+        MessageDigest keyDigest = MessageDigest.getInstance("SHA-256");
+        byte[] keyBytes = keyDigest.digest(encryptionKey.getBytes(StandardCharsets.UTF_8));
         
         SecretKeySpec secretKey = new SecretKeySpec(keyBytes, "AES");
         Cipher cipher = Cipher.getInstance("AES");
         cipher.init(Cipher.ENCRYPT_MODE, secretKey);
         
-        try (FileInputStream fis = new FileInputStream(inputFile);
-             FileOutputStream fos = new FileOutputStream(encryptedFile)) {
+        InputStream fileIn = new FileInputStream(filePath.toFile());
+        try (InputStream in = (digest != null) ? new DigestInputStream(fileIn, digest) : fileIn;
+             GZIPOutputStream gzos = new GZIPOutputStream(new CipherOutputStream(new NonClosingOutputStream(out), cipher), 8192)) {
             
-            byte[] inputBytes = new byte[(int) inputFile.length()];
-            fis.read(inputBytes);
-            
-            byte[] outputBytes = cipher.doFinal(inputBytes);
-            fos.write(outputBytes);
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = in.read(buffer)) != -1) {
+                gzos.write(buffer, 0, len);
+            }
         }
-        
-        return encryptedFile;
+    }
+
+    /**
+     * Converts bytes to a lowercase hexadecimal string.
+     * 
+     * @param bytes The bytes to convert
+     * @return The hexadecimal string
+     */
+    private static String toHex(byte[] bytes) {
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : bytes) {
+            String hex = Integer.toHexString(0xff & b);
+            if (hex.length() == 1) hexString.append('0');
+            hexString.append(hex);
+        }
+        return hexString.toString();
     }
 
     /**
      * Sends a file to the remote server over a socket connection
      * Includes metadata like client label, original filename, and file hash
      * 
-     * @param file The file to send (already compressed and encrypted)
+     * @param filePath The file to send; it is compressed and encrypted while sending
      * @param fileHash The hash of the original file for integrity verification
+     * @param encryptedSize Size of the compressed, encrypted data, measured in the first pass
      * @param originalFileName The name of the original file
      * @return true if the server confirmed successful receipt, false otherwise
      */
-    private boolean sendFileToServer(File file, String fileHash, String originalFileName) {
+    private boolean sendFileToServer(Path filePath, String fileHash, long encryptedSize, String originalFileName) {
         long startTime = System.currentTimeMillis();
         
         try (Socket socket = new Socket()) {
             // Use timeouts so an unreachable or unresponsive server can't block the client forever
             socket.connect(new InetSocketAddress(serverIp, serverPort), CONNECT_TIMEOUT_MILLIS);
             socket.setSoTimeout(socketTimeoutSeconds * 1000);
-            DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
+            DataOutputStream dos = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 65536));
             
             // Send client label
             dos.writeUTF(clientLabel);
@@ -459,16 +450,18 @@ public class JFiltraClient {
             dos.writeUTF(fileHash);
             
             // Send file size
-            dos.writeLong(file.length());
+            dos.writeLong(encryptedSize);
             
-            // Send file data
-            try (FileInputStream fis = new FileInputStream(file)) {
-                byte[] buffer = new byte[4096];
-                int bytesRead;
-                
-                while ((bytesRead = fis.read(buffer)) != -1) {
-                    dos.write(buffer, 0, bytesRead);
-                }
+            // Send file data, compressed and encrypted on the fly
+            CountingOutputStream sentCounter = new CountingOutputStream(dos);
+            writeEncrypted(filePath, sentCounter, null);
+            dos.flush();
+            
+            // The file changed between the two passes, so the server can't accept it.
+            // Dropping the connection makes the server discard it; it is retried on the next poll.
+            if (sentCounter.count != encryptedSize) {
+                logger.warn("File changed while being sent, will retry: " + originalFileName);
+                return false;
             }
             
             // Check response
@@ -487,7 +480,7 @@ public class JFiltraClient {
                 logger.error("Server rejected file " + originalFileName + ": " + response);
                 return false;
             }
-        } catch (IOException e) {
+        } catch (IOException | GeneralSecurityException e) {
             logger.error("Error sending file " + originalFileName + " to server: " + e, e);
             return false;
         }
@@ -504,14 +497,7 @@ public class JFiltraClient {
     private String keyFingerprint(String key) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(key.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hexString = new StringBuilder();
-            for (int i = 0; i < 4; i++) {
-                String hex = Integer.toHexString(0xff & hash[i]);
-                if (hex.length() == 1) hexString.append('0');
-                hexString.append(hex);
-            }
-            return hexString.toString();
+            return toHex(digest.digest(key.getBytes(StandardCharsets.UTF_8))).substring(0, 8);
         } catch (Exception e) {
             return "(unavailable)";
         }
@@ -582,4 +568,60 @@ public class JFiltraClient {
         // Add shutdown hook
         Runtime.getRuntime().addShutdownHook(new Thread(client::stop));
     }
-} 
+
+    /**
+     * Counts the bytes written through it.
+     */
+    private static class CountingOutputStream extends FilterOutputStream {
+        long count;
+        
+        CountingOutputStream(OutputStream out) {
+            super(out);
+        }
+        
+        @Override
+        public void write(int b) throws IOException {
+            out.write(b);
+            count++;
+        }
+        
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            out.write(b, off, len);
+            count += len;
+        }
+    }
+
+    /**
+     * Passes writes through, but doesn't close the underlying stream when closed,
+     * so the socket stays open for the server's reply.
+     */
+    private static class NonClosingOutputStream extends FilterOutputStream {
+        NonClosingOutputStream(OutputStream out) {
+            super(out);
+        }
+        
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            out.write(b, off, len);
+        }
+        
+        @Override
+        public void close() throws IOException {
+            flush();
+        }
+    }
+
+    /**
+     * Discards everything written to it (Java 8 has no built-in equivalent).
+     */
+    private static class DiscardingOutputStream extends OutputStream {
+        @Override
+        public void write(int b) {
+        }
+        
+        @Override
+        public void write(byte[] b, int off, int len) {
+        }
+    }
+}
