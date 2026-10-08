@@ -16,6 +16,7 @@ package client;
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
@@ -51,14 +52,33 @@ public class JFiltraClient {
     private ScheduledExecutorService scheduler; // Scheduler for periodic directory polling
     private int pollingIntervalSeconds;         // Time between directory scans
     private int socketTimeoutSeconds;           // Max wait for the server's response
+    private int stablePolls;                    // Scans a file must stay unchanged before it is sent
+    private String ignorePatterns;              // File name patterns that are never sent
+    private List<PathMatcher> ignoreMatchers;   // Compiled ignore patterns
     
     // Max wait when connecting to the server
     private static final int CONNECT_TIMEOUT_MILLIS = 10000;
     
-    // Size and modification time of each file seen in the previous scan. A file is only
-    // sent once it is unchanged between two scans, so files still being written are skipped.
-    // Only accessed from the single scheduler thread.
-    private Map<Path, String> previousSnapshots = new HashMap<>();
+    // Files that are never sent unless ignore.patterns says otherwise: hidden files (the
+    // server rejects them), and common names for files still being written or locked
+    private static final String DEFAULT_IGNORE_PATTERNS = ".*,*.part,*.tmp,*.crdownload,~$*";
+    
+    // Size, modification time and number of unchanged scans for each file seen in the
+    // previous scan. Only accessed from the single scheduler thread.
+    private Map<Path, FileState> previousStates = new HashMap<>();
+    
+    /**
+     * A file's size and modification time, and how many scans in a row it has been unchanged.
+     */
+    private static class FileState {
+        final String snapshot;
+        final int unchangedScans;
+        
+        FileState(String snapshot, int unchangedScans) {
+            this.snapshot = snapshot;
+            this.unchangedScans = unchangedScans;
+        }
+    }
 
     /**
      * Constructor - Initializes the client with configuration from the specified file
@@ -69,36 +89,104 @@ public class JFiltraClient {
         try {
             // Load configuration
             config = new Properties();
-            config.load(new FileInputStream(configPath));
+            try (InputStream in = new FileInputStream(configPath)) {
+                config.load(in);
+            }
             
             // Parse configuration
             // Trim each entry and skip empty ones, so "dir1, dir2" works as expected
             sourceDirs = new ArrayList<>();
-            for (String dir : config.getProperty("source.directories").split(",")) {
+            for (String dir : requiredProperty("source.directories").split(",")) {
                 if (!dir.trim().isEmpty()) {
                     sourceDirs.add(dir.trim());
                 }
             }
-            serverIp = config.getProperty("server.host");
-            serverPort = Integer.parseInt(config.getProperty("server.port"));
-            clientLabel = config.getProperty("client.label");
+            if (sourceDirs.isEmpty()) {
+                throw new IllegalArgumentException("Setting source.directories contains no directories");
+            }
+            serverIp = requiredProperty("server.host");
+            serverPort = intProperty("server.port", null, 1, 65535);
+            clientLabel = requiredProperty("client.label");
+            // Not trimmed: spaces may be part of the key, and it must match the server's entry exactly
             encryptionKey = config.getProperty("encryption.key");
+            if (encryptionKey == null || encryptionKey.isEmpty()) {
+                throw new IllegalArgumentException("Missing required setting: encryption.key");
+            }
             
             // Get polling interval with default of 10 seconds if not specified
-            String pollingIntervalStr = config.getProperty("polling.interval.seconds");
-            pollingIntervalSeconds = (pollingIntervalStr != null) ? 
-                                     Integer.parseInt(pollingIntervalStr) : 10;
+            pollingIntervalSeconds = intProperty("polling.interval.seconds", 10, 1, 86400);
             
             // Max wait for the server's response; the server needs time to decrypt,
             // decompress and store large files before it replies (default 120 seconds)
-            socketTimeoutSeconds = Integer.parseInt(config.getProperty("socket.timeout.seconds", "120").trim());
+            socketTimeoutSeconds = intProperty("socket.timeout.seconds", 120, 1, 86400);
+            
+            // Scans a file must stay unchanged before it is sent (default 2)
+            stablePolls = intProperty("stable.polls", 2, 1, 1000);
+            
+            // File name patterns that are never sent (an empty value sends everything)
+            ignorePatterns = config.getProperty("ignore.patterns", DEFAULT_IGNORE_PATTERNS).trim();
+            ignoreMatchers = new ArrayList<>();
+            for (String pattern : ignorePatterns.split(",")) {
+                if (!pattern.trim().isEmpty()) {
+                    ignoreMatchers.add(FileSystems.getDefault().getPathMatcher("glob:" + pattern.trim()));
+                }
+            }
 
             // print environment info
             printEnvironmentInfo();
-        } catch (IOException e) {
-            logger.error("Error loading configuration: " + e.getMessage(), e);
+        } catch (IOException | IllegalArgumentException e) {
+            // Log a clear message and exit if configuration is missing or invalid
+            logger.error("Error loading configuration: " + e.getMessage());
             System.exit(1);
         }
+    }
+    
+    /**
+     * Reads a required setting.
+     * 
+     * @param name The setting name
+     * @return The trimmed value
+     * @throws IllegalArgumentException If the setting is missing or empty
+     */
+    private String requiredProperty(String name) {
+        String value = config.getProperty(name);
+        if (value == null || value.trim().isEmpty()) {
+            throw new IllegalArgumentException("Missing required setting: " + name);
+        }
+        return value.trim();
+    }
+    
+    /**
+     * Reads a whole-number setting and checks its range.
+     * 
+     * @param name The setting name
+     * @param defaultValue Value used when the setting is missing, or null if it is required
+     * @param min Smallest allowed value
+     * @param max Largest allowed value
+     * @return The setting's value
+     * @throws IllegalArgumentException If the setting is missing, not a number or out of range
+     */
+    private int intProperty(String name, Integer defaultValue, int min, int max) {
+        String value = config.getProperty(name);
+        if (value == null || value.trim().isEmpty()) {
+            if (defaultValue == null) {
+                throw new IllegalArgumentException("Missing required setting: " + name);
+            }
+            return defaultValue;
+        }
+        
+        String error = "Setting " + name + " must be a whole number from " + min + " to " + max
+                + ", but is: " + value.trim();
+        int parsed;
+        try {
+            parsed = Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(error);
+        }
+        if (parsed < min || parsed > max) {
+            throw new IllegalArgumentException(error);
+        }
+        return parsed;
     }
 
     /**
@@ -123,7 +211,7 @@ public class JFiltraClient {
             String timeStamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
             logger.info(timeStamp + " - Scanning directories for files to send...");
             
-            Map<Path, String> currentSnapshots = new HashMap<>();
+            Map<Path, FileState> currentStates = new HashMap<>();
            
             for (String dirPath : sourceDirs) {
                 try {
@@ -137,11 +225,11 @@ public class JFiltraClient {
                     // Close the directory listing after use, otherwise every scan leaks a file handle
                     List<Path> files = new ArrayList<>();
                     try (Stream<Path> entries = Files.list(dir)) {
-                        entries.filter(Files::isRegularFile).forEach(files::add);
+                        entries.filter(Files::isRegularFile).filter(file -> !isIgnored(file)).forEach(files::add);
                     }
                     
                     for (Path file : files) {
-                        processIfStable(file, currentSnapshots);
+                        processIfStable(file, currentStates);
                     }
                 } catch (Exception e) {
                     logger.error("Error polling directory " + dirPath + ": " + e.getMessage(), e);
@@ -149,25 +237,45 @@ public class JFiltraClient {
                 }
             }
             
-            previousSnapshots = currentSnapshots;
+            previousStates = currentStates;
         } catch (Throwable t) {
             logger.error("Unexpected error while polling directories: " + t, t);
         }
     }
 
     /**
-     * Sends a file only if its size and modification time are unchanged since the
-     * previous scan, so files that are still being written or copied are not sent.
+     * Checks whether a file matches one of the ignore patterns.
      * 
      * @param file The file to check
-     * @param currentSnapshots Snapshots collected during the current scan
+     * @return true if the file must not be sent
      */
-    private void processIfStable(Path file, Map<Path, String> currentSnapshots) {
+    private boolean isIgnored(Path file) {
+        Path fileName = file.getFileName();
+        for (PathMatcher matcher : ignoreMatchers) {
+            if (matcher.matches(fileName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Sends a file only once its size and modification time have stayed unchanged for
+     * stable.polls scans in a row, so files that are still being written or copied are
+     * not sent.
+     * 
+     * @param file The file to check
+     * @param currentStates File states collected during the current scan
+     */
+    private void processIfStable(Path file, Map<Path, FileState> currentStates) {
         try {
             String snapshot = fileSnapshot(file);
-            currentSnapshots.put(file, snapshot);
+            FileState previous = previousStates.get(file);
+            int unchangedScans = (previous != null && previous.snapshot.equals(snapshot))
+                    ? previous.unchangedScans + 1 : 0;
+            currentStates.put(file, new FileState(snapshot, unchangedScans));
             
-            if (snapshot.equals(previousSnapshots.get(file))) {
+            if (unchangedScans >= stablePolls) {
                 processFile(file, snapshot);
             } else {
                 logger.debug("Waiting for file to stop changing: " + file.getFileName());
@@ -304,7 +412,7 @@ public class JFiltraClient {
         
         // Generate a 32-byte (256-bit) key using SHA-256
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        byte[] keyBytes = digest.digest(encryptionKey.getBytes());
+        byte[] keyBytes = digest.digest(encryptionKey.getBytes(StandardCharsets.UTF_8));
         
         SecretKeySpec secretKey = new SecretKeySpec(keyBytes, "AES");
         Cipher cipher = Cipher.getInstance("AES");
@@ -386,18 +494,27 @@ public class JFiltraClient {
     }
 
     /**
-     * Masks the encryption key for secure logging
-     * Shows only first and last 4 characters
+     * Returns a short, non-reversible fingerprint of the encryption key for logging.
+     * The same key gives the same fingerprint on server and client, so mismatched keys
+     * can be spotted in the logs without revealing any part of the key.
      * 
-     * @param key The encryption key to mask
-     * @return A masked version of the key
+     * @param key The encryption key
+     * @return The first 8 hex characters of the key's SHA-256 hash
      */
-    private String maskEncryptionKey(String key) {
-        if (key == null || key.length() <= 8) {
-            return "***masked***";
+    private String keyFingerprint(String key) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(key.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hexString = new StringBuilder();
+            for (int i = 0; i < 4; i++) {
+                String hex = Integer.toHexString(0xff & hash[i]);
+                if (hex.length() == 1) hexString.append('0');
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch (Exception e) {
+            return "(unavailable)";
         }
-        // Show only first 4 and last 4 characters for security
-        return key.substring(0, 4) + "..." + key.substring(key.length() - 4);
     }
 
     /**
@@ -405,7 +522,6 @@ public class JFiltraClient {
      * Useful for debugging and audit purposes
      */
     private void printEnvironmentInfo() {
-        String maskedKey = maskEncryptionKey(encryptionKey);
         logger.info("=========================================");
         logger.info("=== Client jFiltra Started ==============");
         logger.info("=========================================");
@@ -414,10 +530,12 @@ public class JFiltraClient {
         logger.info("Client Label: " + clientLabel);
         logger.info("Server IP: " + serverIp);
         logger.info("Server Port: " + serverPort);
-        logger.info("Encryption Key: " + maskedKey);
+        logger.info("Encryption Key Fingerprint: " + keyFingerprint(encryptionKey));
         logger.info("Source Directories: " + String.join(", ", sourceDirs));
         logger.info("Polling Interval: " + pollingIntervalSeconds + " seconds");
         logger.info("Socket Timeout: " + socketTimeoutSeconds + " seconds");
+        logger.info("Stable Polls: " + stablePolls);
+        logger.info("Ignore Patterns: " + (ignorePatterns.isEmpty() ? "(none)" : ignorePatterns));
         logger.info("-----------------------------------------");
         try {
             

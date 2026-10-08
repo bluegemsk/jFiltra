@@ -14,18 +14,31 @@
 package server;
 
 import java.io.*;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
 import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
@@ -42,7 +55,7 @@ import org.apache.logging.log4j.Logger;
  * Security features:
  * - Client-specific encryption keys
  * - File hash verification
- * - Secure key logging (masking)
+ * - Secure key logging (fingerprint only)
  */
 public class JFiltraServer {
     // Logger for application logging
@@ -56,12 +69,32 @@ public class JFiltraServer {
     private ServerSocket serverSocket;
     private boolean running;
     
-    // Limits that protect the server from stalled or oversized transfers
-    private int socketTimeoutSeconds;  // Max wait for data from a client before giving up
-    private long maxFileSizeBytes;     // Max size of a transferred file (sent and uncompressed)
+    // Limits that protect the server from stalled, slow or oversized transfers
+    private int socketTimeoutSeconds;    // Max wait for data from a client before giving up
+    private int headerTimeoutSeconds;    // Max time for a client to send the transfer header
+    private int transferTimeoutSeconds;  // Max total time for one transfer, including processing
+    private int maxConnections;          // Max transfers handled at the same time
+    private int maxConnectionsPerIp;     // Max simultaneous connections from one IP address
+    private long maxFileSizeBytes;       // Max size of a transferred file (sent and uncompressed)
     
     // Thread pool for handling multiple client connections
     private ExecutorService executor;
+    
+    // Closes connections that exceed their time limit (daemon thread, never blocks shutdown)
+    private ScheduledExecutorService watchdog;
+    
+    // Number of open connections per client IP address
+    private final Map<InetAddress, Integer> connectionsPerIp = new HashMap<>();
+    
+    // Guards the fallback publish path on file systems without hard links
+    private final Object publishLock = new Object();
+    
+    // Windows reserved device names; rejected so stored files stay usable on Windows
+    private static final Pattern WINDOWS_RESERVED_NAME =
+            Pattern.compile("(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\..*)?", Pattern.CASE_INSENSITIVE);
+    
+    // Longest accepted file name in bytes (common file system limit)
+    private static final int MAX_FILE_NAME_BYTES = 255;
     
     // Client-specific configuration
     private Properties clientKeys;    // Maps client IDs to their encryption keys
@@ -75,31 +108,35 @@ public class JFiltraServer {
     public JFiltraServer(String configPath) {
         try {
             // Load main configuration file
-            config = new Properties();
-            config.load(new FileInputStream(configPath));
+            config = loadProperties(configPath);
             
-            // Extract server port from configuration
-            port = Integer.parseInt(config.getProperty("server.port"));
+            // Server port (required)
+            port = intProperty(config, "server.port", null, 1, 65535);
             
             // Read timeout for client connections (default 30 seconds)
-            socketTimeoutSeconds = Integer.parseInt(config.getProperty("socket.timeout.seconds", "30").trim());
+            socketTimeoutSeconds = intProperty(config, "socket.timeout.seconds", 30, 1, 86400);
             
-            // Maximum accepted file size (default 512 MB)
-            maxFileSizeBytes = Long.parseLong(config.getProperty("max.file.size.mb", "512").trim()) * 1024 * 1024;
+            // Time allowed for sending the transfer header (default 5 seconds)
+            headerTimeoutSeconds = intProperty(config, "header.timeout.seconds", 5, 1, 3600);
+            
+            // Total time allowed for one transfer, including processing (default 600 seconds)
+            transferTimeoutSeconds = intProperty(config, "transfer.timeout.seconds", 600, 1, 86400);
+            
+            // Simultaneous transfers in total (default 10) and per client IP address (default 4)
+            maxConnections = intProperty(config, "max.connections", 10, 1, 1000);
+            maxConnectionsPerIp = intProperty(config, "max.connections.per.ip", 4, 1, 1000);
+            
+            // Maximum accepted file size (default 512 MB). Files are processed in memory,
+            // so the size can't exceed 2047 MB.
+            maxFileSizeBytes = intProperty(config, "max.file.size.mb", 512, 1, 2047) * 1024L * 1024L;
             
             // Load client encryption keys from separate file for better security
-            clientKeys = new Properties();
             String clientKeysPath = config.getProperty("client.keys.path");
-            if (clientKeysPath != null) {
-                clientKeys.load(new FileInputStream(clientKeysPath));
-            }
+            clientKeys = (clientKeysPath != null) ? loadProperties(clientKeysPath.trim()) : new Properties();
             
             // Load client storage path mappings from configuration file
-            clientPaths = new Properties();
             String clientPathsConfig = config.getProperty("client.paths.config");
-            if (clientPathsConfig != null) {
-                clientPaths.load(new FileInputStream(clientPathsConfig));
-            }
+            clientPaths = (clientPathsConfig != null) ? loadProperties(clientPathsConfig.trim()) : new Properties();
             
             // Log server startup and configuration details
             logger.info("=========================================");
@@ -108,6 +145,9 @@ public class JFiltraServer {
             logger.info("Server configuration:");
             logger.info("-----------------------------------------");
             logger.info("Socket Timeout: " + socketTimeoutSeconds + " seconds");
+            logger.info("Header Timeout: " + headerTimeoutSeconds + " seconds");
+            logger.info("Transfer Timeout: " + transferTimeoutSeconds + " seconds");
+            logger.info("Max Connections: " + maxConnections + " (per IP: " + maxConnectionsPerIp + ")");
             logger.info("Max File Size: " + (maxFileSizeBytes / (1024 * 1024)) + " MB");
 
             // Log storage paths for all configured clients
@@ -116,34 +156,87 @@ public class JFiltraServer {
                 logger.info("Client: " + key + ", Storage Path: " + path);
             }
             
-            // Log masked encryption keys for security audit purposes
+            // Log key fingerprints (never the keys) so they can be compared with the clients' logs
             for (String key : clientKeys.stringPropertyNames()) {
                 String encryptionKey = clientKeys.getProperty(key);
-                String maskedKey = maskEncryptionKey(encryptionKey);
-                logger.info("Client: " + key + ", Encryption Key: " + maskedKey);
+                logger.info("Client: " + key + ", Encryption Key Fingerprint: " + keyFingerprint(encryptionKey));
             }
             logger.info("-----------------------------------------");
            
-        } catch (IOException e) {
-            // Log error and exit if configuration cannot be loaded
-            logger.error("Error loading configuration: " + e.getMessage(), e);
+        } catch (IOException | IllegalArgumentException e) {
+            // Log a clear message and exit if configuration is missing or invalid
+            logger.error("Error loading configuration: " + e.getMessage());
             System.exit(1);
         }
     }
     
     /**
-     * Masks the encryption key for secure logging purposes.
-     * Shows only first 4 and last 4 characters, with the middle replaced by "..."
+     * Loads a properties file, closing it afterwards.
      * 
-     * @param key The encryption key to mask
-     * @return A masked version of the key for secure logging
+     * @param path Path to the properties file
+     * @return The loaded properties
+     * @throws IOException If the file cannot be read
      */
-    private String maskEncryptionKey(String key) {
-        if (key == null || key.length() <= 8) {
-            return "***masked***";
+    private static Properties loadProperties(String path) throws IOException {
+        Properties props = new Properties();
+        try (InputStream in = new FileInputStream(path)) {
+            props.load(in);
         }
-        // Show only first 4 and last 4 characters for security
-        return key.substring(0, 4) + "..." + key.substring(key.length() - 4);
+        return props;
+    }
+    
+    /**
+     * Reads a whole-number setting and checks its range.
+     * 
+     * @param props The properties to read from
+     * @param name The setting name
+     * @param defaultValue Value used when the setting is missing, or null if it is required
+     * @param min Smallest allowed value
+     * @param max Largest allowed value
+     * @return The setting's value
+     * @throws IllegalArgumentException If the setting is missing, not a number or out of range
+     */
+    private static int intProperty(Properties props, String name, Integer defaultValue, int min, int max) {
+        String value = props.getProperty(name);
+        if (value == null || value.trim().isEmpty()) {
+            if (defaultValue == null) {
+                throw new IllegalArgumentException("Missing required setting: " + name);
+            }
+            return defaultValue;
+        }
+        
+        String error = "Setting " + name + " must be a whole number from " + min + " to " + max
+                + ", but is: " + value.trim();
+        int parsed;
+        try {
+            parsed = Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(error);
+        }
+        if (parsed < min || parsed > max) {
+            throw new IllegalArgumentException(error);
+        }
+        return parsed;
+    }
+    
+    /**
+     * Returns a short, non-reversible fingerprint of an encryption key for logging.
+     * The same key gives the same fingerprint on server and client, so mismatched keys
+     * can be spotted in the logs without revealing any part of the key.
+     * 
+     * @param key The encryption key
+     * @return The first 8 hex characters of the key's SHA-256 hash
+     */
+    private static String keyFingerprint(String key) {
+        if (key == null) {
+            return "(none)";
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return toHex(digest.digest(key.getBytes(StandardCharsets.UTF_8))).substring(0, 8);
+        } catch (Exception e) {
+            return "(unavailable)";
+        }
     }
 
     /**
@@ -155,7 +248,17 @@ public class JFiltraServer {
         running = true;
         
         // Create thread pool for handling multiple client connections
-        executor = Executors.newFixedThreadPool(10);
+        executor = Executors.newFixedThreadPool(maxConnections);
+        
+        // Create the watchdog that enforces per-connection time limits
+        watchdog = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "jfiltra-watchdog");
+            thread.setDaemon(true);
+            return thread;
+        });
+        
+        // Remove temporary files left behind if the server was stopped in the middle of a transfer
+        cleanUpPartFiles();
         
         try {
             // Start server socket on configured port
@@ -167,7 +270,22 @@ public class JFiltraServer {
             // Main server loop - accept connections and process in separate threads
             while (running) {
                 Socket clientSocket = serverSocket.accept();
-                executor.submit(() -> handleClient(clientSocket));
+                InetAddress clientAddress = clientSocket.getInetAddress();
+                
+                // Limit connections per IP address, so a single host can't occupy every worker
+                if (!acquireConnectionSlot(clientAddress)) {
+                    logger.warn("Too many connections from " + clientAddress.getHostAddress() + ", connection refused");
+                    closeQuietly(clientSocket);
+                    continue;
+                }
+                
+                executor.submit(() -> {
+                    try {
+                        handleClient(clientSocket);
+                    } finally {
+                        releaseConnectionSlot(clientAddress);
+                    }
+                });
             }
         } catch (IOException e) {
             // Only log as error if the exception wasn't caused by manual server shutdown
@@ -178,6 +296,95 @@ public class JFiltraServer {
             // Let worker threads finish and exit, so the JVM doesn't stay alive without
             // accepting connections if the server loop ends unexpectedly
             executor.shutdown();
+        }
+    }
+
+    /**
+     * Reserves a connection slot for a client IP address.
+     * 
+     * @param address The client's IP address
+     * @return true if the connection may proceed, false if the address has too many connections
+     */
+    private synchronized boolean acquireConnectionSlot(InetAddress address) {
+        int open = connectionsPerIp.getOrDefault(address, 0);
+        if (open >= maxConnectionsPerIp) {
+            return false;
+        }
+        connectionsPerIp.put(address, open + 1);
+        return true;
+    }
+    
+    /**
+     * Releases a connection slot reserved with acquireConnectionSlot.
+     * 
+     * @param address The client's IP address
+     */
+    private synchronized void releaseConnectionSlot(InetAddress address) {
+        int open = connectionsPerIp.getOrDefault(address, 1) - 1;
+        if (open <= 0) {
+            connectionsPerIp.remove(address);
+        } else {
+            connectionsPerIp.put(address, open);
+        }
+    }
+    
+    /**
+     * Schedules a connection to be closed when its time limit runs out. Closing the
+     * socket interrupts any blocked read, so a client that sends data very slowly
+     * can't hold a worker thread longer than the limit.
+     * 
+     * @param socket The client connection
+     * @param seconds The time limit
+     * @param limitName Name of the limit, for the log message
+     * @return The scheduled task; cancel it when the connection finishes in time
+     */
+    private ScheduledFuture<?> scheduleClose(Socket socket, int seconds, String limitName) {
+        return watchdog.schedule(() -> {
+            if (!socket.isClosed()) {
+                logger.warn("Closing connection from " + socket.getInetAddress().getHostAddress()
+                        + ": " + limitName + " of " + seconds + " seconds exceeded");
+                closeQuietly(socket);
+            }
+        }, seconds, TimeUnit.SECONDS);
+    }
+    
+    /**
+     * Closes a socket, ignoring errors.
+     * 
+     * @param socket The socket to close
+     */
+    private void closeQuietly(Socket socket) {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // Nothing more to do
+        }
+    }
+    
+    /**
+     * Deletes leftover ".jfiltra-*.part" files from all storage directories. They remain
+     * when the server is stopped while writing a file, and are never completed later.
+     */
+    private void cleanUpPartFiles() {
+        Set<String> storageDirs = new LinkedHashSet<>();
+        for (String key : clientPaths.stringPropertyNames()) {
+            storageDirs.add(clientPaths.getProperty(key).trim());
+        }
+        storageDirs.add("incoming");
+        
+        for (String dirPath : storageDirs) {
+            Path dir = Paths.get(dirPath);
+            if (!Files.isDirectory(dir)) {
+                continue;
+            }
+            try (DirectoryStream<Path> partFiles = Files.newDirectoryStream(dir, ".jfiltra-*.part")) {
+                for (Path partFile : partFiles) {
+                    Files.deleteIfExists(partFile);
+                    logger.info("Deleted leftover temporary file: " + partFile);
+                }
+            } catch (IOException e) {
+                logger.warn("Could not clean up temporary files in " + dir + ": " + e.getMessage());
+            }
         }
     }
 
@@ -214,6 +421,7 @@ public class JFiltraServer {
         File uncompressedFile = null;
         Path partFile = null;
         DataOutputStream dos = null;
+        ScheduledFuture<?> deadline = null;
         
         try {
             // Log client connection with IP address for audit purposes
@@ -221,6 +429,9 @@ public class JFiltraServer {
             
             // Don't let a stalled or idle connection hold a worker thread forever
             clientSocket.setSoTimeout(socketTimeoutSeconds * 1000);
+            
+            // The header must arrive quickly; this also stops clients that send it byte by byte
+            deadline = scheduleClose(clientSocket, headerTimeoutSeconds, "header time limit");
             
             // Initialize data streams for communication with client
             DataInputStream dis = new DataInputStream(clientSocket.getInputStream());
@@ -240,6 +451,10 @@ public class JFiltraServer {
             long fileSize = dis.readLong();
             
             logger.info("Receiving file: " + originalFileName + " from client: " + clientLabel);
+            
+            // Header received - from now on, limit the total time of the transfer
+            deadline.cancel(false);
+            deadline = scheduleClose(clientSocket, transferTimeoutSeconds, "transfer time limit");
             
             // Start timing the file processing for performance logging
             long startTime = System.currentTimeMillis();
@@ -310,24 +525,28 @@ public class JFiltraServer {
             // Resolve destination inside the storage directory, rejecting names that could escape it
             File destinationFile = resolveSafeDestination(storageDir, originalFileName);
             if (destinationFile == null) {
-                // Security error - file name contains path components (e.g. "../")
-                logger.error("Rejected unsafe file name: " + originalFileName + " from client: " + clientLabel);
+                // File name contains path components (e.g. "../") or is not allowed
+                logger.error("Rejected invalid file name: " + originalFileName + " from client: " + clientLabel);
                 dos.writeUTF("ERROR: Invalid file name");
                 return;
             }
 
             // Never overwrite an existing file
             if (destinationFile.exists()) {
-                logger.error("File already exists: " + destinationFile + " (client: " + clientLabel + ")");
-                dos.writeUTF("ERROR: File already exists");
+                respondToExistingFile(dos, destinationFile, fileHash, originalFileName, clientLabel);
                 return;
             }
             
-            // Write to a hidden temporary file in the storage directory, then rename it into
-            // place, so other programs never see a partially written file
+            // Write to a hidden temporary file in the storage directory first, so other
+            // programs never see a partially written file
             partFile = storageDir.toPath().resolve(".jfiltra-" + UUID.randomUUID() + ".part");
             Files.copy(uncompressedFile.toPath(), partFile);
-            moveIntoPlace(partFile, destinationFile.toPath());
+            
+            // Publish under the real name; fails if another transfer stored the name meanwhile
+            if (!publishFile(partFile, destinationFile.toPath())) {
+                respondToExistingFile(dos, destinationFile, fileHash, originalFileName, clientLabel);
+                return;
+            }
             
             // Calculate processing duration for performance logging
             long endTime = System.currentTimeMillis();
@@ -359,6 +578,11 @@ public class JFiltraServer {
                 }
             }
         } finally {
+            // The connection is finished - stop its time limit
+            if (deadline != null) {
+                deadline.cancel(false);
+            }
+            
             // Clean up temporary files on success and on every error path
             deleteTempFile(encryptedFile);
             deleteTempFile(decryptedFile);
@@ -398,6 +622,63 @@ public class JFiltraServer {
             remaining -= bytesRead;
         }
         return remaining;
+    }
+
+    /**
+     * Answers a client whose file name is already taken in the storage directory.
+     * If the stored file has the same content (e.g. the client missed the server's
+     * earlier reply and sent the file again), the transfer counts as successful, so
+     * the client can delete its copy instead of retrying forever.
+     * 
+     * @param dos The stream to answer the client on
+     * @param existingFile The file already stored under this name
+     * @param fileHash The SHA-256 hash of the file the client sent
+     * @param fileName The file name, for logging
+     * @param clientLabel The client's label, for logging
+     * @throws Exception If the existing file cannot be read or the answer cannot be sent
+     */
+    private void respondToExistingFile(DataOutputStream dos, File existingFile, String fileHash,
+                                       String fileName, String clientLabel) throws Exception {
+        if (existingFile.isFile() && calculateFileHash(existingFile.toPath()).equals(fileHash)) {
+            logger.info("File already stored with identical content: " + fileName + " (client: " + clientLabel + ")");
+            dos.writeUTF("SUCCESS");
+        } else {
+            logger.error("File already exists with different content: " + existingFile + " (client: " + clientLabel + ")");
+            dos.writeUTF("ERROR: File already exists");
+        }
+    }
+
+    /**
+     * Publishes a fully written temporary file under its final name, never overwriting
+     * an existing file. Creating a hard link is atomic and fails if the name is taken,
+     * so two transfers of the same name at the same time can't overwrite each other.
+     * 
+     * @param partFile The fully written temporary file in the storage directory
+     * @param target The final file name
+     * @return true if the file was published, false if the name is already taken
+     * @throws IOException If the file cannot be published
+     */
+    private boolean publishFile(Path partFile, Path target) throws IOException {
+        try {
+            Files.createLink(target, partFile);
+        } catch (FileAlreadyExistsException e) {
+            return false;
+        } catch (UnsupportedOperationException | IOException e) {
+            // File system without hard links (e.g. FAT or some network shares): rename instead,
+            // guarded by a lock so this server's own transfers still can't overwrite each other
+            logger.debug("Hard link not supported in " + target.getParent() + ", using rename: " + e);
+            synchronized (publishLock) {
+                if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+                    return false;
+                }
+                moveIntoPlace(partFile, target);
+            }
+            return true;
+        }
+        
+        // Published via the hard link - remove the temporary name
+        Files.delete(partFile);
+        return true;
     }
 
     /**
@@ -444,6 +725,30 @@ public class JFiltraServer {
                 || fileName.indexOf('\0') >= 0) {
             return null;
         }
+        
+        // No hidden files: this also reserves the ".jfiltra-" prefix for the server's temporary files
+        if (fileName.startsWith(".")) {
+            return null;
+        }
+        
+        // No control characters (they could also forge extra lines in the logs)
+        for (int i = 0; i < fileName.length(); i++) {
+            if (Character.isISOControl(fileName.charAt(i))) {
+                return null;
+            }
+        }
+        
+        // Keep within the usual file system limit for name length
+        if (fileName.getBytes(StandardCharsets.UTF_8).length > MAX_FILE_NAME_BYTES) {
+            return null;
+        }
+        
+        // Names Windows can't handle (CON, NUL, COM1..., or ending in a dot or space), so
+        // stored files can be copied to Windows systems later
+        if (WINDOWS_RESERVED_NAME.matcher(fileName).matches()
+                || fileName.endsWith(".") || fileName.endsWith(" ")) {
+            return null;
+        }
 
         // Double-check the resolved path is directly inside the storage directory
         Path baseDir = storageDir.toPath().toAbsolutePath().normalize();
@@ -468,7 +773,7 @@ public class JFiltraServer {
         
         // Generate a 32-byte (256-bit) key using SHA-256 hash of the provided key
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        byte[] keyBytes = digest.digest(encryptionKey.getBytes());
+        byte[] keyBytes = digest.digest(encryptionKey.getBytes(StandardCharsets.UTF_8));
         
         // Initialize AES cipher for decryption
         SecretKeySpec secretKey = new SecretKeySpec(keyBytes, "AES");
@@ -544,20 +849,31 @@ public class JFiltraServer {
         // Create SHA-256 digest for hash calculation
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         
-        // Read file contents
-        byte[] fileBytes = Files.readAllBytes(filePath);
+        // Read the file in chunks, so even large files don't need to fit in memory
+        try (InputStream in = new FileInputStream(filePath.toFile())) {
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = in.read(buffer)) != -1) {
+                digest.update(buffer, 0, len);
+            }
+        }
         
-        // Calculate hash
-        byte[] hashBytes = digest.digest(fileBytes);
-        
-        // Convert hash bytes to hexadecimal string
+        return toHex(digest.digest());
+    }
+
+    /**
+     * Converts bytes to a lowercase hexadecimal string.
+     * 
+     * @param bytes The bytes to convert
+     * @return The hexadecimal string
+     */
+    private static String toHex(byte[] bytes) {
         StringBuilder hexString = new StringBuilder();
-        for (byte hashByte : hashBytes) {
-            String hex = Integer.toHexString(0xff & hashByte);
+        for (byte b : bytes) {
+            String hex = Integer.toHexString(0xff & b);
             if (hex.length() == 1) hexString.append('0');
             hexString.append(hex);
         }
-        
         return hexString.toString();
     }
 
@@ -580,6 +896,9 @@ public class JFiltraServer {
         // Shutdown thread pool gracefully
         if (executor != null) {
             executor.shutdown();
+        }
+        if (watchdog != null) {
+            watchdog.shutdownNow();
         }
         
         logger.info("JFiltraServer stopped");

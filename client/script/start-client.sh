@@ -1,8 +1,5 @@
 #!/bin/bash
 
-
-#!/bin/bash
-
 # Set variables
 CLIENT_DIR="$(cd .. && pwd)"
 LIB_DIR="$CLIENT_DIR/lib"
@@ -25,7 +22,7 @@ echo "------------------------"
 # Create log directory if it doesn't exist
 mkdir -p "$CLIENT_DIR/logs"
 
-# Change to the server directory to make relative paths work
+# Change to the client directory to make relative paths work
 cd "$CLIENT_DIR"
 
 # Start the client

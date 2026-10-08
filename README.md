@@ -63,11 +63,22 @@ committed to git:
 | `client.keys.path`    | No       | File that maps each client label to its key                |
 | `client.paths.config` | No       | File that maps each client label to its storage directory  |
 | `socket.timeout.seconds` | No    | Seconds to wait for data from a client before closing the connection (default `30`) |
-| `max.file.size.mb`    | No       | Largest file accepted, both as sent and after decompression (default `512`) |
+| `header.timeout.seconds` | No    | Seconds a client has to send the transfer header: label, file name, hash and size (default `5`) |
+| `transfer.timeout.seconds` | No  | Maximum total seconds for one transfer, including processing (default `600`) |
+| `max.connections`     | No       | Maximum transfers handled at the same time (default `10`)  |
+| `max.connections.per.ip` | No    | Maximum simultaneous connections from one IP address (default `4`) |
+| `max.file.size.mb`    | No       | Largest file accepted, both as sent and after decompression, from `1` to `2047` (default `512`) |
 
 Relative paths are resolved from the `server/` folder, because the start script
 runs the server from there. Leaving out `client.keys.path` means no keys are
 loaded, so the server rejects every client.
+
+Both server and client check their settings at startup. A missing required
+setting or an invalid value stops the program with a message naming the
+setting, for example `Missing required setting: server.port`.
+
+`.properties` files are read as ISO-8859-1. Write any other characters, in keys
+or paths, as `\uXXXX` escapes. For example, `ľ` becomes `\u013e`.
 
 `server/config/client_keys.properties` has one line per client, in the form
 `<client.label>=<encryption key>`. A client whose label is not listed is rejected.
@@ -89,6 +100,8 @@ stored in `server/incoming/`. The storage directory is created if it doesn't exi
 | `encryption.key`           | Yes      | This client's key; must match the server's entry for this label |
 | `polling.interval.seconds` | No       | How often to scan the directories (default `10`; shipped value: `3`) |
 | `socket.timeout.seconds`   | No       | Seconds to wait for the server's response before retrying later (default `120`) |
+| `stable.polls`             | No       | Number of scans a file must stay unchanged before it is sent (default `2`) |
+| `ignore.patterns`          | No       | Comma-separated file name patterns that are never sent (default `.*,*.part,*.tmp,*.crdownload,~$*`; empty sends everything) |
 
 > **Change the keys before use.** The shipped configuration contains placeholder
 > keys (`CHANGE_ME_...`). Generate your own secret for each client, for example
@@ -141,9 +154,18 @@ echo "hello jFiltra" > /tmp/jfiltra/source1/test.txt
 
 - The client sends only the files directly inside each source directory.
   Subdirectories are not scanned.
-- A file is sent only once its size and modification time are unchanged between
-  two scans, so files that are still being written or copied are not sent half
-  finished. A new file is therefore sent after one to two polling intervals.
+- A file is sent only once its size and modification time have stayed unchanged
+  for `stable.polls` scans in a row, so files that are still being written or
+  copied are not sent half finished. With the default of 2, a new file is sent
+  after two to three polling intervals.
+- A program that writes part of a file, pauses for longer than that, and then
+  continues can't be detected this way. The client would send the first part and
+  delete the file. Programs that write into a source directory should therefore
+  write to a temporary name and rename the file when it is complete. Files ending
+  in `.part` or `.tmp` are ignored by default for exactly this purpose.
+- Files matching `ignore.patterns` are never sent. By default these are hidden
+  files (starting with `.`), files ending in `.part`, `.tmp` or `.crdownload`, and
+  Office lock files (starting with `~$`).
 - If a file changes while it is being sent, the client keeps it instead of
   deleting it, so the new content is not lost.
 - The client deletes a file only after the server replies with success. In all
@@ -157,17 +179,28 @@ echo "hello jFiltra" > /tmp/jfiltra/source1/test.txt
 - When the server rejects a file, the client logs the reason, for example
   `Server rejected file report.pdf: ERROR: File already exists`. The server log
   has the details.
-- Existing files on the server are never overwritten. While a file with the same
-  name is already there, the client keeps retrying and logging an error until
-  that file is moved or renamed.
+- Existing files on the server are never overwritten, even when two transfers of
+  the same name arrive at the same time.
+- If a file with the same name **and the same content** is already stored, the
+  transfer counts as successful and the client deletes its copy. This happens,
+  for example, when the client missed the server's reply and sends the file again.
+- If a file with the same name but **different content** is already stored, the
+  client keeps retrying and logging an error until that file is moved or renamed.
+- The server rejects file names that:
+  - contain a path (such as `../` or `/`);
+  - start with `.` (hidden files);
+  - contain control characters;
+  - are longer than 255 bytes;
+  - are reserved on Windows (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, also with an extension, such as `con.txt`);
+  - end with a dot or a space.
 - The server first writes each file under a hidden temporary name
-  (`.jfiltra-<random>.part`) in the storage directory, then renames it to its
-  real name. Other programs watching the storage directory therefore never see a
-  half-written file. If the server is stopped in the middle of a write, a
-  `.part` file may be left behind and can be deleted.
+  (`.jfiltra-<random>.part`) in the storage directory, then publishes it under
+  its real name in one atomic step. Other programs watching the storage directory
+  therefore never see a half-written file. If the server is stopped in the middle
+  of a write, the leftover `.part` file is deleted the next time the server starts.
 - Each file is held in memory while it is encrypted and decrypted. On the server,
   `max.file.size.mb` sets the largest accepted file. Give the server a Java heap
-  of well over twice that size. No file can be larger than 2GB. On the client, a
+  several times that size. No file can be larger than 2047MB. On the client, a
   file too large for its heap is logged as an error on each poll and left in
   place, and the other files are still sent.
 
@@ -178,8 +211,10 @@ Logs are written to `server/logs/server_jfiltra.log` and
 rolls over at 10MB and keeps 10 backups. You can change this in
 `server/config/log4j2.properties` and `client/config/log4j2.properties`.
 
-Encryption keys are never written to the logs in full. Only the first and last
-4 characters are shown.
+Encryption keys are never written to the logs. Instead, server and client log a
+fingerprint of each key: the first 8 hex characters of its SHA-256 hash. The same
+key gives the same fingerprint on both sides, so you can compare them in the logs
+to find a mismatched key.
 
 ## Security notes
 
@@ -195,10 +230,13 @@ keep the following in mind:
 - Client labels are not secret. The server rejects unknown labels before storing
   anything. With a known label but the wrong key, decryption fails and the data
   is discarded.
-- The read timeout and `max.file.size.mb` limit how long a connection can stay
-  open and how much data it can send. Anyone who can reach the port can still
-  keep the server's 10 worker threads busy for that long. Restrict access to the
-  port with a firewall.
+- Limits stop a single connection from holding the server for long:
+  - The header must arrive within `header.timeout.seconds`.
+  - The whole transfer must finish within `transfer.timeout.seconds`.
+  - One IP address can have at most `max.connections.per.ip` connections at a time.
+  - Files can be at most `max.file.size.mb`.
+- Several hosts together can still keep all `max.connections` workers busy
+  within these limits. Restrict access to the port with a firewall.
 
 ## License
 
