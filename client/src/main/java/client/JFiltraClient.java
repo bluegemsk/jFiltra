@@ -4,11 +4,6 @@
 * See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 *
 * Required Notice: Copyright 2026 Vladimir Rumanko - BLUEGEM (https://github.com/bluegemsk/jFiltra)
-*
-* ## Support This Project  
-* If this code helps you, consider sending a small crypto donation:  
-* - **SOL**: `DL5sEEG6z666vyety2FdDZtTF1pMtMAnjKXSdZTYg34K` 
-* - **BNB**: `0xC08f5CC86610e400bb3c12Fe8a085514F7e786E0` 
 */
 
 package client;
@@ -74,6 +69,18 @@ public class JFiltraClient {
     // previous scan. Only accessed from the single scheduler thread.
     private Map<Path, FileState> previousStates = new HashMap<>();
     
+    // Files the server rejected for a reason that retrying can't fix, with their size and
+    // modification time at that moment. They are skipped until they change.
+    // Only accessed from the single scheduler thread.
+    private final Map<Path, String> rejectedFiles = new HashMap<>();
+    
+    // Server replies that mean the same file will always be rejected
+    private static final Set<String> PERMANENT_REJECTIONS = new HashSet<>(Arrays.asList(
+            "ERROR: File too large", "ERROR: Invalid file name"));
+    
+    // Shortest accepted encryption key; shorter keys could be guessed offline
+    private static final int MIN_KEY_LENGTH = 32;
+    
     /**
      * A file's size and modification time, and how many scans in a row it has been unchanged.
      */
@@ -116,6 +123,7 @@ public class JFiltraClient {
             if (encryptionKey == null || encryptionKey.isEmpty()) {
                 throw new IllegalArgumentException("Missing required setting: encryption.key");
             }
+            checkKeyStrength(clientLabel, encryptionKey);
             
             // Get polling interval with default of 10 seconds if not specified
             pollingIntervalSeconds = intProperty("polling.interval.seconds", 10, 1, 86400);
@@ -169,6 +177,27 @@ public class JFiltraClient {
         Properties props = new Properties();
         props.load(new StringReader(text));
         return props;
+    }
+    
+    /**
+     * Checks that the encryption key is not the shipped placeholder and long enough
+     * not to be guessed offline.
+     * 
+     * @param label The client label, for the error message
+     * @param key The encryption key
+     * @throws IllegalArgumentException If the key is a placeholder or too short
+     */
+    private static void checkKeyStrength(String label, String key) {
+        String hint = " Generate a key with: openssl rand -base64 32";
+        if (key.trim().startsWith("CHANGE_ME")) {
+            throw new IllegalArgumentException("Encryption key for " + label
+                    + " is still the CHANGE_ME placeholder." + hint);
+        }
+        int length = key.codePointCount(0, key.length());
+        if (length < MIN_KEY_LENGTH) {
+            throw new IllegalArgumentException("Encryption key for " + label + " is too short ("
+                    + length + " characters, at least " + MIN_KEY_LENGTH + " required)." + hint);
+        }
     }
     
     /**
@@ -252,10 +281,14 @@ public class JFiltraClient {
                         continue;
                     }
                     
-                    // Close the directory listing after use, otherwise every scan leaks a file handle
+                    // Close the directory listing after use, otherwise every scan leaks a file handle.
+                    // Symbolic links are skipped: following them would send (and then delete the
+                    // link to) any file the client can read, such as files outside the source directory.
                     List<Path> files = new ArrayList<>();
                     try (Stream<Path> entries = Files.list(dir)) {
-                        entries.filter(Files::isRegularFile).filter(file -> !isIgnored(file)).forEach(files::add);
+                        entries.filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
+                               .filter(file -> !isIgnored(file))
+                               .forEach(files::add);
                     }
                     
                     for (Path file : files) {
@@ -268,6 +301,9 @@ public class JFiltraClient {
             }
             
             previousStates = currentStates;
+            
+            // Forget rejected files that are gone
+            rejectedFiles.keySet().retainAll(currentStates.keySet());
         } catch (Throwable t) {
             logger.error("Unexpected error while polling directories: " + t, t);
         }
@@ -305,6 +341,11 @@ public class JFiltraClient {
                     ? previous.unchangedScans + 1 : 0;
             currentStates.put(file, new FileState(snapshot, unchangedScans));
             
+            // Rejected before for a reason retrying can't fix, and unchanged since
+            if (snapshot.equals(rejectedFiles.get(file))) {
+                return;
+            }
+            
             if (unchangedScans >= stablePolls) {
                 processFile(file, snapshot);
             } else {
@@ -325,7 +366,7 @@ public class JFiltraClient {
      * @throws IOException If the attributes cannot be read
      */
     private String fileSnapshot(Path file) throws IOException {
-        BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
+        BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
         return attrs.size() + ":" + attrs.lastModifiedTime().toMillis();
     }
 
@@ -349,9 +390,15 @@ public class JFiltraClient {
             String fileHash = toHex(digest.digest());
             
             // Second pass: compress, encrypt and send the file straight to the server
-            boolean sent = sendFileToServer(filePath, fileHash, sizeCounter.count, fileName);
+            String response = sendFileToServer(filePath, fileHash, sizeCounter.count, fileName);
             
-            if (sent) {
+            // Don't resend a file the server will always reject; it is tried again once it changes
+            if (PERMANENT_REJECTIONS.contains(response)) {
+                rejectedFiles.put(filePath, snapshot);
+                logger.error("File " + fileName + " will not be sent again until it changes");
+            }
+            
+            if ("SUCCESS".equals(response)) {
                 
                 // File sent: test3.txt (Duration: 0.016 seconds)
                 logger.info("File sent: " + fileName + " (Hash: " + fileHash + ")");
@@ -393,7 +440,8 @@ public class JFiltraClient {
         Cipher cipher = Cipher.getInstance("AES");
         cipher.init(Cipher.ENCRYPT_MODE, secretKey);
         
-        InputStream fileIn = new FileInputStream(filePath.toFile());
+        // NOFOLLOW_LINKS: if the file was replaced by a symbolic link after the scan, don't read the link's target
+        InputStream fileIn = Files.newInputStream(filePath, LinkOption.NOFOLLOW_LINKS);
         try (InputStream in = (digest != null) ? new DigestInputStream(fileIn, digest) : fileIn;
              GZIPOutputStream gzos = new GZIPOutputStream(new CipherOutputStream(new NonClosingOutputStream(out), cipher), 8192)) {
             
@@ -429,9 +477,9 @@ public class JFiltraClient {
      * @param fileHash The hash of the original file for integrity verification
      * @param encryptedSize Size of the compressed, encrypted data, measured in the first pass
      * @param originalFileName The name of the original file
-     * @return true if the server confirmed successful receipt, false otherwise
+     * @return The server's reply ("SUCCESS" or "ERROR: ..."), or null if no reply was received
      */
-    private boolean sendFileToServer(Path filePath, String fileHash, long encryptedSize, String originalFileName) {
+    private String sendFileToServer(Path filePath, String fileHash, long encryptedSize, String originalFileName) {
         long startTime = System.currentTimeMillis();
         
         try (Socket socket = new Socket()) {
@@ -461,7 +509,7 @@ public class JFiltraClient {
             // Dropping the connection makes the server discard it; it is retried on the next poll.
             if (sentCounter.count != encryptedSize) {
                 logger.warn("File changed while being sent, will retry: " + originalFileName);
-                return false;
+                return null;
             }
             
             // Check response
@@ -474,15 +522,15 @@ public class JFiltraClient {
                 if ("SUCCESS".equals(response)) {
                     String message = "File sent: " + originalFileName + " (Duration: " + duration + " seconds)";
                     logger.info(message);
-                    return true;
+                    return response;
                 }
                 
                 logger.error("Server rejected file " + originalFileName + ": " + response);
-                return false;
+                return response;
             }
         } catch (IOException | GeneralSecurityException e) {
             logger.error("Error sending file " + originalFileName + " to server: " + e, e);
-            return false;
+            return null;
         }
     }
 

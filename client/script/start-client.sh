@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Run from the script directory, wherever the script is called from
+cd "$(dirname "$0")" || exit 1
+
 # Set variables
 CLIENT_DIR="$(cd .. && pwd)"
 LIB_DIR="$CLIENT_DIR/lib"

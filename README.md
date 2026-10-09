@@ -1,20 +1,23 @@
 # jFiltra
 
-jFiltra is a lightweight Java client/server tool for moving files securely from
-watched directories to a central server.
+jFiltra is a lightweight Java client/server tool for moving files from watched
+directories to a central server, reliably and with as little setup as possible.
 
 - The **client** polls one or more source directories. For each file it computes a
-  SHA-256 hash, compresses the file with GZIP, encrypts it with AES using a
+  SHA-256 hash, compresses the file with GZIP, scrambles it with AES using a
   client-specific key, and sends it to the server. After the server confirms
   receipt, the client deletes the original file.
 - The **server** accepts connections from multiple clients. It looks up the
   client's key, decrypts and decompresses the file, checks the SHA-256 hash, and
   stores the file in that client's configured storage directory.
 
+jFiltra does not encrypt the connection. Use it on a trusted network, or through
+a VPN or SSH tunnel; see [Security notes](#security-notes).
+
 ## Requirements
 
 - Java 8 or newer, with `java` on your `PATH` (JDK for compiling, JRE for running)
-- Bash (to run the scripts)
+- Bash on Linux and macOS, or the Command Prompt on Windows (to run the scripts)
 - [Apache Log4j 2](https://logging.apache.org/log4j/2.x/) 2.26.1, placed in both `server/lib/` and `client/lib/`:
   - [`log4j-api-2.26.1.jar`](https://repo1.maven.org/maven2/org/apache/logging/log4j/log4j-api/2.26.1/log4j-api-2.26.1.jar)
   - [`log4j-core-2.26.1.jar`](https://repo1.maven.org/maven2/org/apache/logging/log4j/log4j-core/2.26.1/log4j-core-2.26.1.jar)
@@ -36,12 +39,14 @@ done
 server/
   config/                 server.properties, client_keys.properties,
                           client_paths.properties, log4j2.properties
-  script/                 compile.sh, start-server.sh
+  script/                 compile.sh/.bat, start-server.sh/.bat
   src/main/java/server/   JFiltraServer.java
 client/
   config/                 client.properties, log4j2.properties
-  script/                 compile.sh, start-client.sh
+  script/                 compile.sh/.bat, start-client.sh/.bat
   src/main/java/client/   JFiltraClient.java
+test/
+  smoke-test.sh           end-to-end test (see Testing)
 ```
 
 These folders are created when you set up, build and run jFiltra. They are not
@@ -105,57 +110,72 @@ stored in `server/incoming/`. The storage directory is created if it doesn't exi
 | `stable.polls`             | No       | Number of scans a file must stay unchanged before it is sent (default `2`) |
 | `ignore.patterns`          | No       | Comma-separated file name patterns that are never sent (default `.*,*.part,*.tmp,*.crdownload,~$*`; empty sends everything) |
 
-> **Change the keys before use.** The shipped configuration contains placeholder
-> keys (`CHANGE_ME_...`). Generate your own secret for each client, for example
-> with `openssl rand -base64 24`, and put the same value in the server's
-> `client_keys.properties` and the client's `client.properties`.
+### Keys
+
+Each client needs its own key, at least 32 characters long. Put the same key in
+the server's `client_keys.properties` and in the client's `client.properties`.
+Server and client refuse to start with the shipped `CHANGE_ME` placeholder or
+with a shorter key.
+
+Generate a key with:
+
+```bash
+openssl rand -base64 32
+```
+
+On Windows, `openssl` comes with Git for Windows. In PowerShell 7 you can also use
+`[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))`.
 
 ## Build
 
-Download the Log4j 2 JARs first (see [Requirements](#requirements)). Then run each
-compile script from its own `script/` directory:
+Download the Log4j 2 JARs first (see [Requirements](#requirements)). Then run the
+compile scripts; they work from any directory:
 
 ```bash
-cd server/script
-./compile.sh   # builds server/lib/jfiltra-server.jar
+server/script/compile.sh   # builds server/lib/jfiltra-server.jar
+client/script/compile.sh   # builds client/lib/jfiltra-client.jar
 ```
 
-```bash
-cd client/script
-./compile.sh   # builds client/lib/jfiltra-client.jar
-```
+On Windows, run `server\script\compile.bat` and `client\script\compile.bat`.
 
 ## Run
 
-Start the server first, then one or more clients. Run each start script from its
-own `script/` directory, because the scripts locate the rest of the project
-relative to it:
+Start the server first, then one or more clients. The start scripts work from
+any directory:
 
 ```bash
-cd server/script
-./start-server.sh
+server/script/start-server.sh
 ```
 
 ```bash
-cd client/script
-./start-client.sh
+client/script/start-client.sh
 ```
+
+On Windows, run `server\script\start-server.bat` and `client\script\start-client.bat`.
 
 Both run in the foreground. Press `Ctrl+C` to stop them.
 
 To try it locally with the default configuration:
 
-```bash
-mkdir -p /tmp/jfiltra/source1 /tmp/jfiltra/source2
-echo "hello jFiltra" > /tmp/jfiltra/source1/test.txt
-# A few seconds later the file appears in /tmp/jfiltra/received/client1/
-# and is removed from /tmp/jfiltra/source1/
-```
+1. Generate a key (see [Keys](#keys)) and replace the `CHANGE_ME` placeholder
+   for `client1` with it in both `server/config/client_keys.properties` and
+   `client/config/client.properties`.
+2. Start the server and the client as shown above.
+3. Drop a file into a source directory:
+
+   ```bash
+   mkdir -p /tmp/jfiltra/source1 /tmp/jfiltra/source2
+   echo "hello jFiltra" > /tmp/jfiltra/source1/test.txt
+   # A few seconds later the file appears in /tmp/jfiltra/received/client1/
+   # and is removed from /tmp/jfiltra/source1/
+   ```
 
 ## How transfers behave
 
 - The client sends only the files directly inside each source directory.
   Subdirectories are not scanned.
+- Symbolic links are never sent or deleted. Following them could send any file
+  the client can read, including files outside the source directory.
 - A file is sent only once its size and modification time have stayed unchanged
   for `stable.polls` scans in a row, so files that are still being written or
   copied are not sent half finished. With the default of 2, a new file is sent
@@ -180,7 +200,10 @@ echo "hello jFiltra" > /tmp/jfiltra/source1/test.txt
   - a file with the same name already exists in the storage directory.
 - When the server rejects a file, the client logs the reason, for example
   `Server rejected file report.pdf: ERROR: File already exists`. The server log
-  has the details.
+  has the details. A wrong key is reported as `ERROR: Decryption failed`.
+- A file rejected as too large (`ERROR: File too large`) or with an invalid name
+  (`ERROR: Invalid file name`) is not sent again until it changes, because
+  retrying can't help. The client logs this once.
 - Existing files on the server are never overwritten, even when two transfers of
   the same name arrive at the same time.
 - If a file with the same name **and the same content** is already stored, the
@@ -201,7 +224,10 @@ echo "hello jFiltra" > /tmp/jfiltra/source1/test.txt
   therefore never see a half-written file. If the server is stopped in the middle
   of a write, the leftover `.part` file is deleted the next time the server starts.
 - Files are processed in small chunks, so memory use stays the same whatever the
-  file size, and there is no size limit apart from `max.file.size.mb`.
+  file size, and there is no size limit apart from `max.file.size.mb`. The limit
+  applies to the data as sent too. Compression can't shrink data that is already
+  compressed (such as ZIP files, videos or photos) and makes it slightly larger,
+  so such a file just under the limit can be rejected.
 - The client writes no temporary files. It reads each file twice: once to
   compute its hash and the size of the data to send, and once while sending.
   The server writes only the `.part` file in the storage directory.
@@ -220,14 +246,37 @@ fingerprint of each key: the first 8 hex characters of its SHA-256 hash. The sam
 key gives the same fingerprint on both sides, so you can compare them in the logs
 to find a mismatched key.
 
+Control characters in client-supplied file names and labels are logged as `?`,
+so they can't forge extra log lines.
+
 ## Security notes
 
-jFiltra is suitable for trusted networks. Before using it anywhere more exposed,
-keep the following in mind:
+jFiltra is built for simple, reliable file exchange on trusted networks. It is
+**not** a secure file transfer product:
 
-- Files are encrypted with Java's default `AES` cipher mode (ECB) using a key
-  derived from SHA-256 of the configured secret. Transfers are not authenticated
-  beyond the hash check, and the connection itself does not use TLS.
+- The connection is not encrypted (no TLS). Client labels, file names, file
+  sizes and hashes travel in plain text.
+- File content is scrambled with AES in ECB mode. That keeps it from being read
+  at a glance, but it is not strong encryption: identical files produce
+  identical data on the network, and patterns in the content can show through.
+- Transfers are not protected against replay. Someone who records a transfer can
+  send it to the server again, also under a different file name, without
+  knowing the key.
+
+To send files over an untrusted network, such as the internet, run jFiltra
+through a VPN or an SSH tunnel. For example, on the client machine:
+
+```bash
+ssh -N -L 9000:localhost:9000 user@server-host
+```
+
+and set `server.host=localhost` in `client.properties`. The SSH connection then
+encrypts and authenticates everything between client and server.
+
+Protection that jFiltra does provide:
+
+- Keys must be at least 32 characters (see [Keys](#keys)), so they can't be
+  guessed.
 - The server accepts only plain file names from clients. It rejects any name
   containing a path (such as `../` or `/`), so a client cannot write outside its
   storage directory.
@@ -241,6 +290,27 @@ keep the following in mind:
   - Files can be at most `max.file.size.mb`.
 - Several hosts together can still keep all `max.connections` workers busy
   within these limits. Restrict access to the port with a firewall.
+
+## Testing
+
+`test/smoke-test.sh` builds server and client, runs them in a temporary
+directory, and checks the main behaviours: delivery, skipped files and symbolic
+links, oversized files, wrong keys, duplicates, and placeholder keys. It needs
+Java and the Log4j 2 JARs in `server/lib` and `client/lib`:
+
+```bash
+test/smoke-test.sh
+```
+
+It prints `PASS` or `FAIL` for each check and exits with code `0` when all pass.
+The same test runs on GitHub for Java 8, 11, 17 and 21 on every push.
+
+## Support this project
+
+jFiltra is free. If it helps you, consider sending a small crypto donation:
+
+- **SOL**: `DL5sEEG6z666vyety2FdDZtTF1pMtMAnjKXSdZTYg34K`
+- **BNB**: `0xC08f5CC86610e400bb3c12Fe8a085514F7e786E0`
 
 ## License
 

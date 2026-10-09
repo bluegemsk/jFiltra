@@ -4,11 +4,6 @@
 * See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 *
 * Required Notice: Copyright 2026 Vladimir Rumanko - BLUEGEM (https://github.com/bluegemsk/jFiltra)
-*
-* ## Support This Project  
-* If this code helps you, consider sending a small crypto donation:  
-* - **SOL**: `DL5sEEG6z666vyety2FdDZtTF1pMtMAnjKXSdZTYg34K` 
-* - **BNB**: `0xC08f5CC86610e400bb3c12Fe8a085514F7e786E0` 
 */
 
 package server;
@@ -45,6 +40,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
+import java.util.zip.ZipException;
 import javax.crypto.Cipher;
 import javax.crypto.CipherInputStream;
 import javax.crypto.spec.SecretKeySpec;
@@ -59,10 +55,11 @@ import org.apache.logging.log4j.Logger;
  * them in designated client-specific storage locations. Files are streamed from the
  * network straight into the storage directory, so memory use doesn't depend on file size.
  * 
- * Security features:
- * - Client-specific encryption keys
+ * Protection features:
+ * - Client-specific keys; file content is AES-encrypted in ECB mode, which hides it
+ *   from casual inspection but is not strong encryption (see "Security notes" in README)
  * - File hash verification
- * - Secure key logging (fingerprint only)
+ * - Key fingerprints in logs instead of keys
  */
 public class JFiltraServer {
     // Logger for application logging
@@ -102,6 +99,9 @@ public class JFiltraServer {
     
     // Longest accepted file name in bytes (common file system limit)
     private static final int MAX_FILE_NAME_BYTES = 255;
+    
+    // Shortest accepted encryption key; shorter keys could be guessed offline
+    private static final int MIN_KEY_LENGTH = 32;
     
     // Client-specific configuration
     private Properties clientKeys;    // Maps client IDs to their encryption keys
@@ -160,6 +160,11 @@ public class JFiltraServer {
             for (String key : clientPaths.stringPropertyNames()) {
                 String path = clientPaths.getProperty(key);
                 logger.info("Client: " + key + ", Storage Path: " + path);
+            }
+            
+            // Refuse placeholder or short keys, which could be guessed offline
+            for (String label : clientKeys.stringPropertyNames()) {
+                checkKeyStrength(label, clientKeys.getProperty(label));
             }
             
             // Log key fingerprints (never the keys) so they can be compared with the clients' logs
@@ -236,6 +241,53 @@ public class JFiltraServer {
         return parsed;
     }
     
+    /**
+     * Checks that an encryption key is not the shipped placeholder and long enough
+     * not to be guessed offline.
+     * 
+     * @param label The client label the key belongs to, for the error message
+     * @param key The encryption key
+     * @throws IllegalArgumentException If the key is a placeholder or too short
+     */
+    private static void checkKeyStrength(String label, String key) {
+        String hint = " Generate a key with: openssl rand -base64 32";
+        if (key.trim().startsWith("CHANGE_ME")) {
+            throw new IllegalArgumentException("Encryption key for " + label
+                    + " is still the CHANGE_ME placeholder." + hint);
+        }
+        int length = key.codePointCount(0, key.length());
+        if (length < MIN_KEY_LENGTH) {
+            throw new IllegalArgumentException("Encryption key for " + label + " is too short ("
+                    + length + " characters, at least " + MIN_KEY_LENGTH + " required)." + hint);
+        }
+    }
+
+    /**
+     * Makes a client-supplied value safe for logging: control characters, which could
+     * forge extra log lines, are replaced with '?'.
+     * 
+     * @param value The value to log
+     * @return The value without control characters
+     */
+    private static String printable(String value) {
+        StringBuilder sb = new StringBuilder(value.length());
+        for (char c : value.toCharArray()) {
+            sb.append(Character.isISOControl(c) ? '?' : c);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Compares two hashes in constant time.
+     * 
+     * @param a The first hash (hex string)
+     * @param b The second hash (hex string)
+     * @return true if both are equal
+     */
+    private static boolean hashesMatch(String a, String b) {
+        return MessageDigest.isEqual(a.getBytes(StandardCharsets.UTF_8), b.getBytes(StandardCharsets.UTF_8));
+    }
+
     /**
      * Returns a short, non-reversible fingerprint of an encryption key for logging.
      * The same key gives the same fingerprint on server and client, so mismatched keys
@@ -436,6 +488,10 @@ public class JFiltraServer {
         DataOutputStream dos = null;
         ScheduledFuture<?> deadline = null;
         
+        // Client-supplied label and file name, safe for logging (see printable)
+        String logLabel = "?";
+        String logName = "?";
+        
         try {
             // Log client connection with IP address for audit purposes
             logger.info("Client connected: " + clientSocket.getInetAddress().getHostAddress());
@@ -452,10 +508,12 @@ public class JFiltraServer {
             
             // Read client identification label (used to determine encryption key and storage path)
             String clientLabel = dis.readUTF();
-            logger.info("Client label: " + clientLabel);
+            logLabel = printable(clientLabel);
+            logger.info("Client label: " + logLabel);
             
             // Read original file name (will be preserved when storing)
             String originalFileName = dis.readUTF();
+            logName = printable(originalFileName);
            
             // Read file hash (for integrity verification)
             String fileHash = dis.readUTF();
@@ -463,7 +521,7 @@ public class JFiltraServer {
             // Read file size (for progress tracking and verification)
             long fileSize = dis.readLong();
             
-            logger.info("Receiving file: " + originalFileName + " from client: " + clientLabel);
+            logger.info("Receiving file: " + logName + " from client: " + logLabel);
             
             // Header received - from now on, limit the total time of the transfer
             deadline.cancel(false);
@@ -474,8 +532,10 @@ public class JFiltraServer {
             
             // Reject invalid or oversized transfers before receiving any data
             if (fileSize < 0 || fileSize > maxFileSizeBytes) {
-                logger.error("Rejected file " + originalFileName + " from client " + clientLabel
+                logger.error("Rejected file " + logName + " from client " + logLabel
                         + ": size " + fileSize + " bytes exceeds limit of " + maxFileSizeBytes + " bytes");
+                // Discard the upload, so the client can read the response
+                new LimitedInputStream(dis, fileSize).skipRemaining();
                 dos.writeUTF("ERROR: File too large");
                 return;
             }
@@ -484,7 +544,7 @@ public class JFiltraServer {
             String encryptionKey = clientKeys.getProperty(clientLabel);
             if (encryptionKey == null) {
                 // Security error - client not authorized or missing key
-                logger.error("No encryption key found for client: " + clientLabel);
+                logger.error("No encryption key found for client: " + logLabel);
                 // Discard the upload without storing it, so the client can read the response
                 new LimitedInputStream(dis, fileSize).skipRemaining();
                 dos.writeUTF("ERROR: No encryption key found");
@@ -499,15 +559,18 @@ public class JFiltraServer {
             
             // Ensure storage directory exists
             File storageDir = new File(clientStoragePath);
-            if (!storageDir.exists()) {
-                storageDir.mkdirs();
+            if (!storageDir.isDirectory() && !storageDir.mkdirs() && !storageDir.isDirectory()) {
+                logger.error("Cannot create storage directory " + storageDir.getAbsolutePath() + " for client " + logLabel);
+                new LimitedInputStream(dis, fileSize).skipRemaining();
+                dos.writeUTF("ERROR: Transfer failed");
+                return;
             }
             
             // Resolve destination inside the storage directory, rejecting names that could escape it
             File destinationFile = resolveSafeDestination(storageDir, originalFileName);
             if (destinationFile == null) {
                 // File name contains path components (e.g. "../") or is not allowed
-                logger.error("Rejected invalid file name: " + originalFileName + " from client: " + clientLabel);
+                logger.error("Rejected invalid file name: " + logName + " from client: " + logLabel);
                 new LimitedInputStream(dis, fileSize).skipRemaining();
                 dos.writeUTF("ERROR: Invalid file name");
                 return;
@@ -527,9 +590,9 @@ public class JFiltraServer {
             String calculatedHash = receiveFile(dis, fileSize, encryptionKey, partFile);
             
             // Verify file integrity by comparing hashes
-            if (!calculatedHash.equals(fileHash)) {
+            if (!hashesMatch(calculatedHash, fileHash)) {
                 // Data integrity error - file corrupted during transfer
-                logger.error("Hash verification failed for file: " + originalFileName);
+                logger.error("Hash verification failed for file: " + logName);
                 dos.writeUTF("ERROR: Hash verification failed");
                 return;
             }
@@ -556,6 +619,14 @@ public class JFiltraServer {
             // Notify client of successful transfer
             dos.writeUTF("SUCCESS");
             
+        } catch (TransferRejectedException e) {
+            // A known reason (e.g. wrong key) - log it without a stack trace and tell the client
+            logger.error("Rejected file " + logName + " from client " + logLabel + ": " + e.getMessage());
+            try {
+                dos.writeUTF(e.reply);
+            } catch (IOException ignored) {
+                // Connection already broken - nothing more to report
+            }
         } catch (Exception e) {
             // Log any errors during client handling
             logger.error("Error handling client: " + e.getMessage(), e);
@@ -627,7 +698,8 @@ public class JFiltraServer {
             while ((len = gzis.read(buffer)) != -1) {
                 totalBytes += len;
                 if (totalBytes > maxFileSizeBytes) {
-                    throw new IOException("Uncompressed size exceeds limit of " + maxFileSizeBytes + " bytes");
+                    throw new TransferRejectedException("ERROR: File too large",
+                            "uncompressed size exceeds limit of " + maxFileSizeBytes + " bytes");
                 }
                 out.write(buffer, 0, len);
             }
@@ -638,6 +710,12 @@ public class JFiltraServer {
                 body.skipRemaining();
             } catch (IOException ignored) {
                 // Connection broken or timed out - the client can't be answered anyway
+            }
+            
+            // Data that can't be decrypted and decompressed means a wrong key (or corrupted data)
+            if (e instanceof ZipException || e.getCause() instanceof GeneralSecurityException) {
+                throw new TransferRejectedException("ERROR: Decryption failed",
+                        "decryption failed (wrong key or corrupted data): " + e.getMessage());
             }
             throw e;
         }
@@ -667,7 +745,7 @@ public class JFiltraServer {
      */
     private void respondToExistingFile(DataOutputStream dos, File existingFile, String fileHash,
                                        String fileName, String clientLabel) throws Exception {
-        if (existingFile.isFile() && calculateFileHash(existingFile.toPath()).equals(fileHash)) {
+        if (existingFile.isFile() && hashesMatch(calculateFileHash(existingFile.toPath()), fileHash)) {
             logger.info("File already stored with identical content: " + fileName + " (client: " + clientLabel + ")");
             dos.writeUTF("SUCCESS");
         } else {
@@ -947,6 +1025,21 @@ public class JFiltraServer {
             while (remaining > 0 && read(buffer, 0, buffer.length) != -1) {
                 // Discard
             }
+        }
+    }
+
+    /**
+     * A transfer refused for a known reason: the reply is sent to the client, and the
+     * message is logged without a stack trace.
+     */
+    private static class TransferRejectedException extends IOException {
+        private static final long serialVersionUID = 1L;
+        
+        final String reply;
+        
+        TransferRejectedException(String reply, String message) {
+            super(message);
+            this.reply = reply;
         }
     }
 }

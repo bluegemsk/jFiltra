@@ -1,0 +1,32 @@
+name: Build and smoke test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [8, 11, 17, 21]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+
+      - name: Download Log4j 2
+        run: |
+          for d in server/lib client/lib; do
+            mkdir -p "$d"
+            for a in log4j-api log4j-core; do
+              curl -fsSL -o "$d/$a-2.26.1.jar" "https://repo1.maven.org/maven2/org/apache/logging/log4j/$a/2.26.1/$a-2.26.1.jar"
+            done
+          done
+
+      - name: Smoke test
+        run: test/smoke-test.sh
