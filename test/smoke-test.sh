@@ -7,13 +7,18 @@
 # (see README). Nothing outside the temporary directory is changed, apart from the
 # build output in server/ and client/.
 #
-# Usage: test/smoke-test.sh            (port 19555, or set JFILTRA_TEST_PORT)
+# Usage: test/smoke-test.sh
+#   JFILTRA_TEST_PORT   first of two ports to use (default 19555)
+#   JFILTRA_TEST_JAVA   java command that runs server and client (default: java),
+#                       e.g. a Java 8 runtime to check JARs built with a newer JDK
 # Exit code: 0 if all checks pass, 1 otherwise.
 
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${JFILTRA_TEST_PORT:-19555}"
+RENAME_PORT=$((PORT + 1))
+JAVA="${JFILTRA_TEST_JAVA:-java}"
 WORK="$(mktemp -d)"
 PIDS=()
 PASSED=0
@@ -63,44 +68,66 @@ echo "Building..."
 "$ROOT/server/script/compile.sh" >/dev/null || { echo "Server build failed"; exit 1; }
 "$ROOT/client/script/compile.sh" >/dev/null || { echo "Client build failed"; exit 1; }
 
+# Major class file version of the first class in a JAR (52 = Java 8)
+class_version() {
+  local jar="$1" class
+  class="$(unzip -Z1 "$jar" | grep '\.class$' | head -1)"
+  unzip -p "$jar" "$class" | od -An -tu1 -j7 -N1 | tr -d ' '
+}
+
+echo "Build checks"
+check "server JAR runs on Java 8 (class version 52)" [ "$(class_version "$ROOT/server/lib/jfiltra-server.jar")" = "52" ]
+check "client JAR runs on Java 8 (class version 52)" [ "$(class_version "$ROOT/client/lib/jfiltra-client.jar")" = "52" ]
+
 # Copy built applications and configs into the temporary directory
-for side in server client client2; do
-  src="${side%2}"
+for side in server server-rename client client2 client3; do
+  src="${side%%[0-9-]*}"
+  src="${src%-rename}"
   mkdir -p "$WORK/$side"
   cp -R "$ROOT/$src/lib" "$ROOT/$src/config" "$WORK/$side/"
 done
-mkdir -p "$WORK/src1" "$WORK/src2" "$WORK/received"
+mkdir -p "$WORK/src1" "$WORK/src2" "$WORK/src3" "$WORK/received/client3"
 
 KEY1="$(random_key)"
 KEY2="$(random_key)"
+KEY3="$(random_key)"
 WRONG_KEY="$(random_key)"
 
-cat > "$WORK/server/config/server.properties" <<EOF
-server.port=$PORT
+write_server_config() {
+  cat > "$1/config/server.properties" <<EOF
+server.port=$2
+server.bind.address=127.0.0.1
 client.keys.path=config/client_keys.properties
 client.paths.config=config/client_paths.properties
 max.file.size.mb=1
+on.name.conflict=$3
 EOF
+}
+write_server_config "$WORK/server" "$PORT" reject
 printf 'client1=%s\nclient2=%s\n' "$KEY1" "$KEY2" > "$WORK/server/config/client_keys.properties"
 printf 'client1=%s\nclient2=%s\n' "$WORK/received/client1" "$WORK/received/client2" > "$WORK/server/config/client_paths.properties"
+write_server_config "$WORK/server-rename" "$RENAME_PORT" rename
+printf 'client3=%s\n' "$KEY3" > "$WORK/server-rename/config/client_keys.properties"
+printf 'client3=%s\n' "$WORK/received/client3" > "$WORK/server-rename/config/client_paths.properties"
 
 write_client_config() {
   cat > "$1/config/client.properties" <<EOF
 client.label=$2
 source.directories=$3
-server.host=localhost
-server.port=$PORT
+server.host=127.0.0.1
+server.port=$5
 encryption.key=$4
 polling.interval.seconds=1
 stable.polls=1
 EOF
 }
-write_client_config "$WORK/client" client1 "$WORK/src1" "$KEY1"
-write_client_config "$WORK/client2" client2 "$WORK/src2" "$WRONG_KEY"
+write_client_config "$WORK/client" client1 "$WORK/src1" "$KEY1" "$PORT"
+write_client_config "$WORK/client2" client2 "$WORK/src2" "$WRONG_KEY" "$PORT"
+write_client_config "$WORK/client3" client3 "$WORK/src3" "$KEY3" "$RENAME_PORT"
 
 start() {
   local dir="$1" class="$2" config="$3" jar="$4"
-  (cd "$dir" && exec java -Dlog4j2.configurationFile="$dir/config/log4j2.properties" \
+  (cd "$dir" && exec "$JAVA" -Dlog4j2.configurationFile="$dir/config/log4j2.properties" \
       -cp "$dir/lib/$jar:$dir/lib/log4j-api-2.26.1.jar:$dir/lib/log4j-core-2.26.1.jar" \
       "$class" "$dir/config/$config" > "$dir/console.log" 2>&1) &
   PIDS+=("$!")
@@ -114,10 +141,14 @@ R1="$WORK/received/client1"
 echo "Startup checks"
 cp -R "$WORK/server" "$WORK/server-weak"
 printf 'client1=CHANGE_ME_client1_secret_key_000\n' > "$WORK/server-weak/config/client_keys.properties"
-(cd "$WORK/server-weak" && java -cp "lib/*" server.JFiltraServer config/server.properties > console.log 2>&1)
+(cd "$WORK/server-weak" && "$JAVA" -cp "lib/*" server.JFiltraServer config/server.properties > console.log 2>&1)
 weak_exit=$?
 check "placeholder key refused at startup" [ "$weak_exit" -eq 1 ]
 check "placeholder error message names the problem" grep -q "CHANGE_ME placeholder" "$WORK/server-weak/console.log"
+(cd "$WORK/client" && "$JAVA" -cp "lib/*" client.JFiltraClient config/missing.properties > missing.log 2>&1)
+missing_exit=$?
+check "missing config file refused at startup" [ "$missing_exit" -eq 1 ]
+check "missing config message shows the full path" grep -q "Configuration file not found: /.*/client/config/missing.properties" "$WORK/client/missing.log"
 
 # Files present before the clients start
 echo "hello jFiltra" > "$WORK/src1/normal.txt"
@@ -133,9 +164,16 @@ wait_for 15 grep -q "Server is running" "$SERVER_LOG" 2>/dev/null || { echo "Ser
 start "$WORK/client" client.JFiltraClient client.properties jfiltra-client.jar
 start "$WORK/client2" client.JFiltraClient client.properties jfiltra-client.jar
 
+(cd "$WORK/server" && "$JAVA" -cp "lib/*" server.JFiltraServer config/server.properties > port-in-use.log 2>&1)
+in_use_exit=$?
+check "second server on a used port exits with code 1" [ "$in_use_exit" -eq 1 ]
+check "server listens on the configured bind address only" grep -q "listening on 127.0.0.1" "$SERVER_LOG"
+
 echo "Transfers"
 wait_for 20 [ -f "$R1/normal.txt" ]
 check "normal file delivered with the same content" cmp -s "$R1/normal.txt" <(echo "hello jFiltra")
+sent_once() { [ "$(count 'File sent: normal.txt' "$CLIENT_LOG")" -eq 1 ]; }
+check "one log line per sent file" wait_for 5 sent_once
 check "source file deleted after delivery" wait_for 5 [ ! -e "$WORK/src1/normal.txt" ]
 
 # Give the clients several polls, so repeated attempts would show up in the logs
@@ -160,8 +198,36 @@ check "resent identical file accepted and deleted" wait_for 15 [ ! -e "$WORK/src
 check "server logged the identical content" grep -q "identical content: same.txt" "$SERVER_LOG"
 echo "different content" > "$WORK/src1/normal.txt"
 check "same name with different content rejected" wait_for 15 grep -q "Server rejected file normal.txt: ERROR: File already exists" "$CLIENT_LOG"
+# With 1 s polls, retries come after 1, 2 and 4 s: at most 4 attempts in 9 s instead of 9
+sleep 9
+check "rejected file retried with growing delays" [ "$(count 'Server rejected file normal.txt' "$CLIENT_LOG")" -le 4 ]
+check "retry delay logged" grep -q "Will retry normal.txt in" "$CLIENT_LOG"
 check "stored file not overwritten" cmp -s "$R1/normal.txt" <(echo "hello jFiltra")
 check "rejected file kept in source" [ -f "$WORK/src1/normal.txt" ]
+
+echo "Name conflict: rename"
+mkdir -p "$WORK/received/client3"
+echo "yesterday's export" > "$WORK/received/client3/export.csv"
+echo "today's export" > "$WORK/src3/export.csv"
+start "$WORK/server-rename" server.JFiltraServer server.properties jfiltra-server.jar
+wait_for 15 grep -q "Server is running" "$WORK/server-rename/logs/server_jfiltra.log" 2>/dev/null
+start "$WORK/client3" client.JFiltraClient client.properties jfiltra-client.jar
+renamed_file() { ls "$WORK/received/client3" | grep '^export_[0-9]\{8\}-[0-9]\{6\}\.csv$' | head -1; }
+has_renamed_file() { [ -n "$(renamed_file)" ]; }
+check "same name with different content stored under a new name" wait_for 15 has_renamed_file
+check "renamed file has the new content" cmp -s "$WORK/received/client3/$(renamed_file)" <(echo "today's export")
+check "existing file left unchanged" cmp -s "$WORK/received/client3/export.csv" <(echo "yesterday's export")
+check "source deleted after storing under a new name" wait_for 5 [ ! -e "$WORK/src3/export.csv" ]
+
+echo "Server down"
+kill "${PIDS[0]}" 2>/dev/null
+wait "${PIDS[0]}" 2>/dev/null
+PIDS[0]=""
+echo "while the server is down" > "$WORK/src1/later.txt"
+check "unreachable server reported in one line" wait_for 10 grep -q "Could not send later.txt: server not reachable" "$CLIENT_LOG"
+check "client waits before trying the server again" grep -q "Will try the server again in" "$CLIENT_LOG"
+check "no stack traces in the client log" [ "$(grep -c '^[[:space:]]*at ' "$CLIENT_LOG")" -eq 0 ]
+check "file kept while the server is down" [ -f "$WORK/src1/later.txt" ]
 
 echo "Cleanliness"
 check "no .part files left in storage" [ -z "$(find "$WORK/received" -name '.jfiltra-*.part')" ]

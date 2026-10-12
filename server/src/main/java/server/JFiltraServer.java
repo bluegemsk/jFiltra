@@ -12,6 +12,7 @@ import java.io.*;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
@@ -20,6 +21,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
@@ -27,8 +29,11 @@ import java.nio.file.StandardOpenOption;
 import java.security.DigestOutputStream;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -62,6 +67,9 @@ import org.apache.logging.log4j.Logger;
  * - Key fingerprints in logs instead of keys
  */
 public class JFiltraServer {
+    // jFiltra release version, shown at startup
+    private static final String VERSION = "1.0.0";
+    
     // Logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraServer.class);
     
@@ -70,6 +78,7 @@ public class JFiltraServer {
     
     // Server network configuration
     private int port;
+    private InetAddress bindAddress;     // Address to listen on; null means all interfaces
     private ServerSocket serverSocket;
     private boolean running;
     
@@ -80,6 +89,10 @@ public class JFiltraServer {
     private int maxConnections;          // Max transfers handled at the same time
     private int maxConnectionsPerIp;     // Max simultaneous connections from one IP address
     private long maxFileSizeBytes;       // Max size of a transferred file (sent and uncompressed)
+    
+    // What to do when a file with the same name but different content is already stored:
+    // false = reject it (the client retries later), true = store it under a new name
+    private boolean renameOnConflict;
     
     // Thread pool for handling multiple client connections
     private ExecutorService executor;
@@ -136,6 +149,22 @@ public class JFiltraServer {
             // Maximum accepted file size (default 512 MB, at most 1 TB)
             maxFileSizeBytes = intProperty(config, "max.file.size.mb", 512, 1, 1048576) * 1024L * 1024L;
             
+            // Network address to listen on (default: all interfaces). 127.0.0.1 accepts only
+            // connections from this machine, e.g. through an SSH tunnel.
+            String bind = config.getProperty("server.bind.address", "").trim();
+            try {
+                bindAddress = bind.isEmpty() ? null : InetAddress.getByName(bind);
+            } catch (UnknownHostException e) {
+                throw new IllegalArgumentException("Setting server.bind.address is not a valid address: " + bind);
+            }
+            
+            // Same name, different content: reject (default) or store under a new name
+            String conflict = config.getProperty("on.name.conflict", "reject").trim().toLowerCase(Locale.ROOT);
+            if (!conflict.equals("reject") && !conflict.equals("rename")) {
+                throw new IllegalArgumentException("Setting on.name.conflict must be reject or rename, but is: " + conflict);
+            }
+            renameOnConflict = conflict.equals("rename");
+            
             // Load client encryption keys from separate file for better security
             String clientKeysPath = config.getProperty("client.keys.path");
             clientKeys = (clientKeysPath != null) ? loadProperties(clientKeysPath.trim()) : new Properties();
@@ -150,6 +179,9 @@ public class JFiltraServer {
             logger.info("=========================================");
             logger.info("Server configuration:");
             logger.info("-----------------------------------------");
+            logger.info("Version: " + VERSION);
+            logger.info("Bind Address: " + (bindAddress == null ? "all interfaces" : bindAddress.getHostAddress()));
+            logger.info("On Name Conflict: " + (renameOnConflict ? "rename" : "reject"));
             logger.info("Socket Timeout: " + socketTimeoutSeconds + " seconds");
             logger.info("Header Timeout: " + headerTimeoutSeconds + " seconds");
             logger.info("Transfer Timeout: " + transferTimeoutSeconds + " seconds");
@@ -191,7 +223,12 @@ public class JFiltraServer {
      * @throws IOException If the file cannot be read or is not valid UTF-8
      */
     private static Properties loadProperties(String path) throws IOException {
-        byte[] bytes = Files.readAllBytes(Paths.get(path));
+        byte[] bytes;
+        try {
+            bytes = Files.readAllBytes(Paths.get(path));
+        } catch (NoSuchFileException e) {
+            throw new IOException("Configuration file not found: " + Paths.get(path).toAbsolutePath());
+        }
         String text;
         try {
             text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
@@ -330,11 +367,12 @@ public class JFiltraServer {
         cleanUpPartFiles();
         
         try {
-            // Start server socket on configured port
-            serverSocket = new ServerSocket(port);
+            // Start server socket on configured port and address (null = all interfaces)
+            serverSocket = new ServerSocket(port, 50, bindAddress);
             
-            // Log the server's IP address for connection information
-            logger.info("Server is running on IP: " + getLocalIpAddress() + " and port " + port);
+            // Log where the server listens, and its IP address for connection information
+            logger.info("Server is running on IP: " + getLocalIpAddress() + " and port " + port
+                    + ", listening on " + (bindAddress == null ? "all interfaces" : bindAddress.getHostAddress()));
             
             // Main server loop - accept connections and process in separate threads
             while (running) {
@@ -359,7 +397,9 @@ public class JFiltraServer {
         } catch (IOException e) {
             // Only log as error if the exception wasn't caused by manual server shutdown
             if (running) {
-                logger.error("Error starting server: " + e.getMessage(), e);
+                // E.g. port already in use. Exit with code 1, so service managers see a failure.
+                logger.error("Error starting server: " + e);
+                System.exit(1);
             }
         } finally {
             // Let worker threads finish and exit, so the JVM doesn't stay alive without
@@ -576,11 +616,16 @@ public class JFiltraServer {
                 return;
             }
 
-            // Never overwrite an existing file; no need to store the upload to decide
+            // Never overwrite an existing file. If it has the same content, or conflicts are
+            // rejected, there is no need to store the upload to answer.
             if (destinationFile.exists()) {
-                new LimitedInputStream(dis, fileSize).skipRemaining();
-                respondToExistingFile(dos, destinationFile, fileHash, originalFileName, clientLabel);
-                return;
+                boolean identical = existingFileMatches(destinationFile, fileHash);
+                if (identical || !renameOnConflict) {
+                    new LimitedInputStream(dis, fileSize).skipRemaining();
+                    respondToNameConflict(dos, identical, destinationFile, clientLabel);
+                    return;
+                }
+                // on.name.conflict=rename: receive the file and store it under a new name below
             }
             
             // Receive, decrypt, decompress and hash the file in one pass, writing it to a
@@ -599,10 +644,22 @@ public class JFiltraServer {
             
             long fileSizeReceived = Files.size(partFile);
             
-            // Publish under the real name; fails if another transfer stored the name meanwhile
+            // Publish under the real name; fails if the name is taken (in rename mode, or
+            // because another transfer stored the name meanwhile)
             if (!publishFile(partFile, destinationFile.toPath())) {
-                respondToExistingFile(dos, destinationFile, fileHash, originalFileName, clientLabel);
-                return;
+                boolean identical = existingFileMatches(destinationFile, fileHash);
+                if (identical || !renameOnConflict) {
+                    respondToNameConflict(dos, identical, destinationFile, clientLabel);
+                    return;
+                }
+                File renamed = publishUnderNewName(partFile, storageDir, originalFileName);
+                if (renamed == null) {
+                    logger.error("No free name found for " + originalFileName + " (client: " + clientLabel + ")");
+                    dos.writeUTF("ERROR: File already exists");
+                    return;
+                }
+                logger.info("File " + originalFileName + " already exists with different content; stored as "
+                        + renamed.getName() + " (client: " + clientLabel + ")");
             }
             
             // Calculate processing duration for performance logging
@@ -620,8 +677,8 @@ public class JFiltraServer {
             dos.writeUTF("SUCCESS");
             
         } catch (TransferRejectedException e) {
-            // A known reason (e.g. wrong key) - log it without a stack trace and tell the client
-            logger.error("Rejected file " + logName + " from client " + logLabel + ": " + e.getMessage());
+            // A known reason (e.g. wrong key, lost connection) - log it without a stack trace and tell the client
+            logger.error("Transfer of file " + logName + " from client " + logLabel + " failed: " + e.getMessage());
             try {
                 dos.writeUTF(e.reply);
             } catch (IOException ignored) {
@@ -712,6 +769,11 @@ public class JFiltraServer {
                 // Connection broken or timed out - the client can't be answered anyway
             }
             
+            // Missing bytes mean the connection was lost, whatever error the incomplete data caused
+            if (body.remaining() > 0) {
+                throw connectionLost(body.remaining(), byteCount);
+            }
+            
             // Data that can't be decrypted and decompressed means a wrong key (or corrupted data)
             if (e instanceof ZipException || e.getCause() instanceof GeneralSecurityException) {
                 throw new TransferRejectedException("ERROR: Decryption failed",
@@ -724,34 +786,87 @@ public class JFiltraServer {
         body.skipRemaining();
         if (body.remaining() > 0) {
             // Client disconnected before sending the whole file
-            throw new EOFException("Incomplete transfer: " + body.remaining() + " bytes missing");
+            throw connectionLost(body.remaining(), byteCount);
         }
         
         return toHex(digest.digest());
     }
 
     /**
+     * Creates the error for an upload that ended before all announced bytes arrived.
+     * 
+     * @param missing Number of bytes not received
+     * @param total Number of bytes announced
+     * @return The exception to throw
+     */
+    private static TransferRejectedException connectionLost(long missing, long total) {
+        return new TransferRejectedException("ERROR: Transfer failed",
+                "connection lost: " + missing + " of " + total + " bytes not received");
+    }
+
+    /**
+     * Checks whether an existing stored file has the given content hash.
+     * 
+     * @param existingFile The stored file
+     * @param fileHash The SHA-256 hash to compare with
+     * @return true if the file exists and has the same content
+     * @throws Exception If the existing file cannot be read
+     */
+    private boolean existingFileMatches(File existingFile, String fileHash) throws Exception {
+        return existingFile.isFile() && hashesMatch(calculateFileHash(existingFile.toPath()), fileHash);
+    }
+
+    /**
      * Answers a client whose file name is already taken in the storage directory.
      * If the stored file has the same content (e.g. the client missed the server's
      * earlier reply and sent the file again), the transfer counts as successful, so
-     * the client can delete its copy instead of retrying forever.
+     * the client can delete its copy instead of retrying.
      * 
      * @param dos The stream to answer the client on
+     * @param identical Whether the stored file has the same content
      * @param existingFile The file already stored under this name
-     * @param fileHash The SHA-256 hash of the file the client sent
-     * @param fileName The file name, for logging
      * @param clientLabel The client's label, for logging
-     * @throws Exception If the existing file cannot be read or the answer cannot be sent
+     * @throws IOException If the answer cannot be sent
      */
-    private void respondToExistingFile(DataOutputStream dos, File existingFile, String fileHash,
-                                       String fileName, String clientLabel) throws Exception {
-        if (existingFile.isFile() && hashesMatch(calculateFileHash(existingFile.toPath()), fileHash)) {
-            logger.info("File already stored with identical content: " + fileName + " (client: " + clientLabel + ")");
+    private void respondToNameConflict(DataOutputStream dos, boolean identical, File existingFile,
+                                       String clientLabel) throws IOException {
+        if (identical) {
+            logger.info("File already stored with identical content: " + existingFile.getName() + " (client: " + clientLabel + ")");
             dos.writeUTF("SUCCESS");
         } else {
             logger.error("File already exists with different content: " + existingFile + " (client: " + clientLabel + ")");
             dos.writeUTF("ERROR: File already exists");
         }
+    }
+
+    /**
+     * Publishes a file under a new name when its name is taken by a file with different
+     * content (on.name.conflict=rename). The new name adds the date and time before the
+     * extension, e.g. export_20261012-150012.csv, and a counter if needed.
+     * 
+     * @param partFile The fully written temporary file in the storage directory
+     * @param storageDir The client's storage directory
+     * @param fileName The original file name
+     * @return The published file, or null if no free valid name was found
+     * @throws IOException If the file cannot be published
+     */
+    private File publishUnderNewName(Path partFile, File storageDir, String fileName) throws IOException {
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+        int dot = fileName.lastIndexOf('.');
+        String base = (dot > 0) ? fileName.substring(0, dot) : fileName;
+        String extension = (dot > 0) ? fileName.substring(dot) : "";
+        
+        for (int i = 1; i <= 100; i++) {
+            String candidate = base + "_" + timestamp + (i > 1 ? "_" + i : "") + extension;
+            File target = resolveSafeDestination(storageDir, candidate);
+            if (target == null) {
+                return null; // e.g. the new name would be too long
+            }
+            if (publishFile(partFile, target.toPath())) {
+                return target;
+            }
+        }
+        return null;
     }
 
     /**
@@ -939,8 +1054,8 @@ public class JFiltraServer {
     public static void main(String[] args) {
         // Validate command-line arguments
         if (args.length < 1) {
-            System.out.println("Error: Missing configuration directory path!");
-            System.out.println("Usage: java JFiltraServer <config-directory-path>");
+            System.out.println("Error: Missing configuration file path!");
+            System.out.println("Usage: java JFiltraServer <config-file>");
             System.exit(1);
         }
 

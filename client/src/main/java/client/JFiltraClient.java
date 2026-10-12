@@ -19,13 +19,12 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.security.DigestInputStream;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
+import java.util.zip.Deflater;
 import java.util.zip.GZIPOutputStream;
 import javax.crypto.Cipher;
 import javax.crypto.CipherOutputStream;
@@ -41,6 +40,9 @@ import org.apache.logging.log4j.Logger;
  * and no temporary files are written.
  */
 public class JFiltraClient {
+    // jFiltra release version, shown at startup
+    private static final String VERSION = "1.0.0";
+    
     // Initialize logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraClient.class);
     
@@ -80,6 +82,42 @@ public class JFiltraClient {
     
     // Shortest accepted encryption key; shorter keys could be guessed offline
     private static final int MIN_KEY_LENGTH = 32;
+    
+    // Longest wait before retrying a file the server rejected (e.g. "File already exists"),
+    // and before trying an unreachable server again
+    private static final long MAX_REJECTION_RETRY_MILLIS = 10 * 60 * 1000L;
+    private static final long MAX_NETWORK_RETRY_MILLIS = 60 * 1000L;
+    
+    // Returned by sendFileToServer when the file changed between the two passes
+    private static final String CHANGED_DURING_SEND = "(file changed while being sent)";
+    
+    // Files the server rejected for a reason that may be fixed later (e.g. a wrong key or
+    // a name conflict), with when to try again. Retrying waits longer after each rejection,
+    // so a file isn't re-sent in full on every poll. Only accessed from the scheduler thread.
+    private final Map<Path, Retry> retries = new HashMap<>();
+    
+    // After a network error, no file is sent before this time (milliseconds), so an
+    // unreachable server isn't tried with every file on every poll
+    private long serverRetryAt = 0;
+    private long serverRetryDelay = 0;
+    
+    // Source directories reported as missing, so the warning is logged only once
+    private final Set<String> missingDirs = new HashSet<>();
+    
+    /**
+     * When to retry a file the server rejected, and the size and modification time it had then.
+     */
+    private static class Retry {
+        final String snapshot;
+        final long delayMillis;
+        final long nextAttemptMillis;
+        
+        Retry(String snapshot, long delayMillis, long nextAttemptMillis) {
+            this.snapshot = snapshot;
+            this.delayMillis = delayMillis;
+            this.nextAttemptMillis = nextAttemptMillis;
+        }
+    }
     
     /**
      * A file's size and modification time, and how many scans in a row it has been unchanged.
@@ -163,7 +201,12 @@ public class JFiltraClient {
      * @throws IOException If the file cannot be read or is not valid UTF-8
      */
     private static Properties loadProperties(String path) throws IOException {
-        byte[] bytes = Files.readAllBytes(Paths.get(path));
+        byte[] bytes;
+        try {
+            bytes = Files.readAllBytes(Paths.get(path));
+        } catch (NoSuchFileException e) {
+            throw new IOException("Configuration file not found: " + Paths.get(path).toAbsolutePath());
+        }
         String text;
         try {
             text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
@@ -267,18 +310,22 @@ public class JFiltraClient {
     private void pollDirectories() {
         // Never let an error escape: the scheduler would silently stop polling for good
         try {
-            String timeStamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-            logger.info(timeStamp + " - Scanning directories for files to send...");
+            logger.debug("Scanning directories for files to send");
             
             Map<Path, FileState> currentStates = new HashMap<>();
            
             for (String dirPath : sourceDirs) {
                 try {
                     Path dir = Paths.get(dirPath);
-                    if (!Files.exists(dir)) {
-                        logger.warn("Directory does not exist: " + dirPath);
-                       
+                    if (!Files.isDirectory(dir)) {
+                        // Warn once, not on every poll
+                        if (missingDirs.add(dirPath)) {
+                            logger.warn("Directory does not exist: " + dirPath + " (checked again on every poll)");
+                        }
                         continue;
+                    }
+                    if (missingDirs.remove(dirPath)) {
+                        logger.info("Directory is available again: " + dirPath);
                     }
                     
                     // Close the directory listing after use, otherwise every scan leaks a file handle.
@@ -304,6 +351,7 @@ public class JFiltraClient {
             
             // Forget rejected files that are gone
             rejectedFiles.keySet().retainAll(currentStates.keySet());
+            retries.keySet().retainAll(currentStates.keySet());
         } catch (Throwable t) {
             logger.error("Unexpected error while polling directories: " + t, t);
         }
@@ -346,11 +394,27 @@ public class JFiltraClient {
                 return;
             }
             
-            if (unchangedScans >= stablePolls) {
-                processFile(file, snapshot);
-            } else {
+            if (unchangedScans < stablePolls) {
                 logger.debug("Waiting for file to stop changing: " + file.getFileName());
+                return;
             }
+            
+            // Rejected before: wait until its retry time, unless the file has changed since
+            Retry retry = retries.get(file);
+            if (retry != null) {
+                if (!retry.snapshot.equals(snapshot)) {
+                    retries.remove(file);
+                } else if (System.currentTimeMillis() < retry.nextAttemptMillis) {
+                    return;
+                }
+            }
+            
+            // Server unreachable recently: wait (scanning goes on, so file changes are still tracked)
+            if (System.currentTimeMillis() < serverRetryAt) {
+                return;
+            }
+            
+            processFile(file, snapshot);
         } catch (NoSuchFileException e) {
             // File was removed between listing and reading its attributes
         } catch (IOException e) {
@@ -379,7 +443,8 @@ public class JFiltraClient {
      */
     private void processFile(Path filePath, String snapshot) {
         String fileName = filePath.getFileName().toString();
-        logger.info("Processing file: " + fileName);
+        logger.debug("Processing file: " + fileName);
+        long startTime = System.currentTimeMillis();
         
         try {
             // First pass: hash the file and measure its compressed, encrypted size, which
@@ -392,32 +457,83 @@ public class JFiltraClient {
             // Second pass: compress, encrypt and send the file straight to the server
             String response = sendFileToServer(filePath, fileHash, sizeCounter.count, fileName);
             
-            // Don't resend a file the server will always reject; it is tried again once it changes
-            if (PERMANENT_REJECTIONS.contains(response)) {
-                rejectedFiles.put(filePath, snapshot);
-                logger.error("File " + fileName + " will not be sent again until it changes");
+            if (CHANGED_DURING_SEND.equals(response)) {
+                // Already logged; the changed file is sent again once it is stable
+                return;
+            }
+            if (response == null) {
+                // No reply: the server is unreachable or the connection was lost
+                scheduleServerRetry();
+                return;
             }
             
+            // The server answered, so it is reachable again
+            serverRetryAt = 0;
+            serverRetryDelay = 0;
+            
             if ("SUCCESS".equals(response)) {
-                
-                // File sent: test3.txt (Duration: 0.016 seconds)
-                logger.info("File sent: " + fileName + " (Hash: " + fileHash + ")");
-                logger.info("File sent: " + fileName + " (Size: " + filePath.toFile().length() + " bytes)");
+                double seconds = (System.currentTimeMillis() - startTime) / 1000.0;
+                String size = snapshot.substring(0, snapshot.indexOf(':'));
+                logger.info(String.format("File sent: %s (%s bytes, %.2f s, SHA-256 %s)", fileName, size, seconds, fileHash));
                 
                 // Delete original file after successful transfer, unless it changed while
                 // being sent - deleting it then would lose the new content
-                if (snapshot.equals(fileSnapshot(filePath))) {
-                    Files.delete(filePath);
-                } else {
+                if (!snapshot.equals(fileSnapshot(filePath))) {
                     logger.warn("File changed while being sent and was not deleted: " + fileName);
+                    return;
                 }
-              
+                try {
+                    Files.delete(filePath);
+                    retries.remove(filePath);
+                } catch (IOException e) {
+                    // Delivered, but it would be sent again on every poll: retry with growing delays
+                    logger.error("File " + fileName + " was delivered but can't be deleted: " + e);
+                    scheduleRetry(filePath, snapshot, fileName);
+                }
+            } else if (PERMANENT_REJECTIONS.contains(response)) {
+                // Don't resend a file the server will always reject; it is tried again once it changes
+                rejectedFiles.put(filePath, snapshot);
+                logger.error("File " + fileName + " will not be sent again until it changes");
+            } else {
+                // Rejected for a reason that may be fixed later (e.g. a wrong key or a name conflict)
+                scheduleRetry(filePath, snapshot, fileName);
             }
+        } catch (IOException e) {
+            // Problems reading the file (e.g. no permission): one line, retried with growing delays
+            logger.error("Error reading file " + fileName + ": " + e);
+            scheduleRetry(filePath, snapshot, fileName);
         } catch (Exception | OutOfMemoryError e) {
             // OutOfMemoryError is caught too, so one file cannot stop the others from being processed
             logger.error("Error processing file " + fileName + ": " + e, e);
            
         }
+    }
+
+    /**
+     * Schedules the next attempt to send a file the server rejected. The delay starts at
+     * the polling interval and doubles after each rejection, up to 10 minutes.
+     * 
+     * @param filePath The rejected file
+     * @param snapshot The file's size and modification time; a change cancels the delay
+     * @param fileName The file name, for logging
+     */
+    private void scheduleRetry(Path filePath, String snapshot, String fileName) {
+        Retry previous = retries.get(filePath);
+        long delay = (previous == null) ? pollingIntervalSeconds * 1000L : previous.delayMillis * 2;
+        delay = Math.min(delay, MAX_REJECTION_RETRY_MILLIS);
+        retries.put(filePath, new Retry(snapshot, delay, System.currentTimeMillis() + delay));
+        logger.warn("Will retry " + fileName + " in " + (delay / 1000) + " s");
+    }
+
+    /**
+     * Pauses all transfers after a network error. The pause starts at the polling
+     * interval and doubles after each failed attempt, up to 1 minute.
+     */
+    private void scheduleServerRetry() {
+        long delay = (serverRetryDelay == 0) ? pollingIntervalSeconds * 1000L : serverRetryDelay * 2;
+        serverRetryDelay = Math.min(delay, MAX_NETWORK_RETRY_MILLIS);
+        serverRetryAt = System.currentTimeMillis() + serverRetryDelay;
+        logger.warn("Will try the server again in " + (serverRetryDelay / 1000) + " s");
     }
 
     /**
@@ -443,7 +559,7 @@ public class JFiltraClient {
         // NOFOLLOW_LINKS: if the file was replaced by a symbolic link after the scan, don't read the link's target
         InputStream fileIn = Files.newInputStream(filePath, LinkOption.NOFOLLOW_LINKS);
         try (InputStream in = (digest != null) ? new DigestInputStream(fileIn, digest) : fileIn;
-             GZIPOutputStream gzos = new GZIPOutputStream(new CipherOutputStream(new NonClosingOutputStream(out), cipher), 8192)) {
+             GZIPOutputStream gzos = new FastGZIPOutputStream(new CipherOutputStream(new NonClosingOutputStream(out), cipher))) {
             
             byte[] buffer = new byte[8192];
             int len;
@@ -477,11 +593,10 @@ public class JFiltraClient {
      * @param fileHash The hash of the original file for integrity verification
      * @param encryptedSize Size of the compressed, encrypted data, measured in the first pass
      * @param originalFileName The name of the original file
-     * @return The server's reply ("SUCCESS" or "ERROR: ..."), or null if no reply was received
+     * @return The server's reply ("SUCCESS" or "ERROR: ..."), CHANGED_DURING_SEND, or null
+     *         if no reply was received (network problem)
      */
     private String sendFileToServer(Path filePath, String fileHash, long encryptedSize, String originalFileName) {
-        long startTime = System.currentTimeMillis();
-        
         try (Socket socket = new Socket()) {
             // Use timeouts so an unreachable or unresponsive server can't block the client forever
             socket.connect(new InetSocketAddress(serverIp, serverPort), CONNECT_TIMEOUT_MILLIS);
@@ -509,26 +624,22 @@ public class JFiltraClient {
             // Dropping the connection makes the server discard it; it is retried on the next poll.
             if (sentCounter.count != encryptedSize) {
                 logger.warn("File changed while being sent, will retry: " + originalFileName);
-                return null;
+                return CHANGED_DURING_SEND;
             }
             
             // Check response
             try (DataInputStream dis = new DataInputStream(socket.getInputStream())) {
                 String response = dis.readUTF();
-                
-                long endTime = System.currentTimeMillis();
-                double duration = (endTime - startTime) / 1000.0;
-                
-                if ("SUCCESS".equals(response)) {
-                    String message = "File sent: " + originalFileName + " (Duration: " + duration + " seconds)";
-                    logger.info(message);
-                    return response;
+                if (!"SUCCESS".equals(response)) {
+                    logger.error("Server rejected file " + originalFileName + ": " + response);
                 }
-                
-                logger.error("Server rejected file " + originalFileName + ": " + response);
                 return response;
             }
-        } catch (IOException | GeneralSecurityException e) {
+        } catch (IOException e) {
+            // Routine network problem (server down, connection refused or lost, server busy): one line
+            logger.warn("Could not send " + originalFileName + ": server not reachable or connection lost (" + e + ")");
+            return null;
+        } catch (GeneralSecurityException e) {
             logger.error("Error sending file " + originalFileName + " to server: " + e, e);
             return null;
         }
@@ -561,6 +672,7 @@ public class JFiltraClient {
         logger.info("=========================================");
         logger.info("Client configuration:");
         logger.info("-----------------------------------------");
+        logger.info("Version: " + VERSION);
         logger.info("Client Label: " + clientLabel);
         logger.info("Server IP: " + serverIp);
         logger.info("Server Port: " + serverPort);
@@ -615,6 +727,18 @@ public class JFiltraClient {
         
         // Add shutdown hook
         Runtime.getRuntime().addShutdownHook(new Thread(client::stop));
+    }
+
+    /**
+     * GZIP output using the fastest compression level. The format is the same as with
+     * the default level, so any jFiltra server can read it. Compressing text and other
+     * compressible data is about 2-3 times faster, at the cost of slightly larger output.
+     */
+    private static class FastGZIPOutputStream extends GZIPOutputStream {
+        FastGZIPOutputStream(OutputStream out) throws IOException {
+            super(out, 8192);
+            def.setLevel(Deflater.BEST_SPEED);
+        }
     }
 
     /**

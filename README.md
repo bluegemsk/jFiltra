@@ -16,7 +16,8 @@ a VPN or SSH tunnel; see [Security notes](#security-notes).
 
 ## Requirements
 
-- Java 8 or newer, with `java` on your `PATH` (JDK for compiling, JRE for running)
+- Java 8 or newer, with `java` on your `PATH` (JDK for compiling, JRE for running).
+  The compile scripts always build JARs that run on Java 8, whatever JDK you build with.
 - Bash on Linux and macOS, or the Command Prompt on Windows (to run the scripts)
 - [Apache Log4j 2](https://logging.apache.org/log4j/2.x/) 2.26.1, placed in both `server/lib/` and `client/lib/`:
   - [`log4j-api-2.26.1.jar`](https://repo1.maven.org/maven2/org/apache/logging/log4j/log4j-api/2.26.1/log4j-api-2.26.1.jar)
@@ -65,14 +66,16 @@ committed to git:
 | Property              | Required | Description                                                |
 |-----------------------|----------|------------------------------------------------------------|
 | `server.port`         | Yes      | Port the server listens on (shipped value: `9000`)         |
+| `server.bind.address` | No       | Network address to listen on (default: all interfaces). `127.0.0.1` accepts only connections from the same machine, for example through an SSH tunnel |
 | `client.keys.path`    | No       | File that maps each client label to its key                |
 | `client.paths.config` | No       | File that maps each client label to its storage directory  |
 | `socket.timeout.seconds` | No    | Seconds to wait for data from a client before closing the connection (default `30`) |
 | `header.timeout.seconds` | No    | Seconds a client has to send the transfer header: label, file name, hash and size (default `5`) |
 | `transfer.timeout.seconds` | No  | Maximum total seconds for one transfer, including processing (default `600`); raise it for large files or slow networks |
 | `max.connections`     | No       | Maximum transfers handled at the same time (default `10`)  |
-| `max.connections.per.ip` | No    | Maximum simultaneous connections from one IP address (default `4`) |
+| `max.connections.per.ip` | No    | Maximum simultaneous connections from one IP address (default `4`); raise it when many clients share one IP address, for example on one host or behind NAT |
 | `max.file.size.mb`    | No       | Largest file accepted, both as sent and after decompression (default `512`) |
+| `on.name.conflict`    | No       | What to do when a file with the same name but different content is already stored: `reject` (default) or `rename`; see [Name conflicts](#name-conflicts) |
 
 Relative paths are resolved from the `server/` folder, because the start script
 runs the server from there. Leaving out `client.keys.path` means no keys are
@@ -126,6 +129,10 @@ openssl rand -base64 32
 On Windows, `openssl` comes with Git for Windows. In PowerShell 7 you can also use
 `[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))`.
 
+> **Don't commit real keys.** Once you have set real keys,
+> `server/config/client_keys.properties` and `client/config/client.properties`
+> contain secrets. Don't commit them to a public repository, or a fork of this one.
+
 ## Build
 
 Download the Log4j 2 JARs first (see [Requirements](#requirements)). Then run the
@@ -137,6 +144,8 @@ client/script/compile.sh   # builds client/lib/jfiltra-client.jar
 ```
 
 On Windows, run `server\script\compile.bat` and `client\script\compile.bat`.
+
+The JARs run on Java 8 or newer, even when built with a newer JDK.
 
 ## Run
 
@@ -170,10 +179,38 @@ To try it locally with the default configuration:
    # and is removed from /tmp/jfiltra/source1/
    ```
 
+### Running as a service
+
+On Linux, systemd can start jFiltra at boot and restart it after a failure. For
+example, for the server in `/opt/jfiltra`, create
+`/etc/systemd/system/jfiltra-server.service`:
+
+```ini
+[Unit]
+Description=jFiltra server
+After=network-online.target
+
+[Service]
+User=jfiltra
+ExecStart=/opt/jfiltra/server/script/start-server.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then run `sudo systemctl enable --now jfiltra-server`. The client works the same
+way with `start-client.sh`. Both exit with code `1` when they can't start, for
+example because the port is in use, so systemd reports the failure.
+
+On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
+`start-server.bat` or `start-client.bat` as a Windows service.
+
 ## How transfers behave
 
 - The client sends only the files directly inside each source directory.
-  Subdirectories are not scanned.
+  Subdirectories are not scanned. To watch a subdirectory, add it to
+  `source.directories` too.
 - Symbolic links are never sent or deleted. Following them could send any file
   the client can read, including files outside the source directory.
 - A file is sent only once its size and modification time have stayed unchanged
@@ -191,26 +228,17 @@ To try it locally with the default configuration:
 - If a file changes while it is being sent, the client keeps it instead of
   deleting it, so the new content is not lost.
 - The client deletes a file only after the server replies with success. In all
-  other cases the file stays where it is and is retried on the next poll. That
-  includes:
-  - the server is unreachable;
-  - the client's label or key is unknown to the server;
-  - the hash check fails;
-  - the server rejects the file name;
-  - a file with the same name already exists in the storage directory.
+  other cases the file stays where it is and is retried (see [Retries](#retries)).
 - When the server rejects a file, the client logs the reason, for example
   `Server rejected file report.pdf: ERROR: File already exists`. The server log
   has the details. A wrong key is reported as `ERROR: Decryption failed`.
-- A file rejected as too large (`ERROR: File too large`) or with an invalid name
-  (`ERROR: Invalid file name`) is not sent again until it changes, because
-  retrying can't help. The client logs this once.
 - Existing files on the server are never overwritten, even when two transfers of
   the same name arrive at the same time.
 - If a file with the same name **and the same content** is already stored, the
   transfer counts as successful and the client deletes its copy. This happens,
   for example, when the client missed the server's reply and sends the file again.
-- If a file with the same name but **different content** is already stored, the
-  client keeps retrying and logging an error until that file is moved or renamed.
+- If a file with the same name but **different content** is already stored, see
+  [Name conflicts](#name-conflicts).
 - The server rejects file names that:
   - contain a path (such as `../` or `/`);
   - start with `.` (hidden files);
@@ -223,16 +251,68 @@ To try it locally with the default configuration:
   its real name in one atomic step. Other programs watching the storage directory
   therefore never see a half-written file. If the server is stopped in the middle
   of a write, the leftover `.part` file is deleted the next time the server starts.
-- Files are processed in small chunks, so memory use stays the same whatever the
-  file size, and there is no size limit apart from `max.file.size.mb`. The limit
-  applies to the data as sent too. Compression can't shrink data that is already
-  compressed (such as ZIP files, videos or photos) and makes it slightly larger,
-  so such a file just under the limit can be rejected.
 - The client writes no temporary files. It reads each file twice: once to
   compute its hash and the size of the data to send, and once while sending.
   The server writes only the `.part` file in the storage directory.
 - If a file changes between the client's two reads, the client drops the
   transfer and sends the file again on a later poll.
+
+### Retries
+
+The client never gives up on a file, but it waits longer between attempts when
+retrying doesn't help right away, so a large file isn't sent again in full on
+every poll:
+
+- **Server unreachable** (server down, connection refused or lost, server busy):
+  the client pauses all transfers. The pause starts at the polling interval and
+  doubles after each failed attempt, up to 1 minute. Each attempt is logged in
+  one line.
+- **Rejected for a reason a person can fix** (`File already exists`, `Decryption
+  failed`, `No encryption key found`, a failed hash check), or delivered but the
+  client can't delete it (no permission): the file is retried after the polling
+  interval, then after twice as long each time, up to 10 minutes. Fixing the
+  problem, for example the key on the server, needs no restart; the file is sent
+  at its next attempt. If the file itself changes, it is sent again right away.
+- **Rejected for a reason retrying can't fix** (`File too large`, `Invalid file
+  name`): the file is not sent again until it changes. The client logs this once.
+
+### Name conflicts
+
+`on.name.conflict` on the server decides what happens when a client sends a file
+whose name is already taken by a file with **different content**:
+
+- `reject` (default): the stored file is kept, and the new file stays on the
+  client. The client retries with growing delays (see [Retries](#retries)) until
+  someone moves or renames the stored file.
+- `rename`: the new file is stored under a new name with the date and time
+  added, for example `export_20261012-150012.csv`, and the client deletes its
+  copy. This suits files that arrive under the same name again and again, such as
+  a daily `export.csv`. In the rare case that the client misses the server's
+  reply, it sends the file again, and it is then stored a second time under
+  another new name.
+
+Files with the same name **and the same content** are never stored twice in
+either mode.
+
+### Large files
+
+Files are processed in small chunks, so memory use stays the same whatever the
+file size, and there is no size limit apart from `max.file.size.mb`. For files
+over 512 MB, change these settings:
+
+| Where  | Setting                    | Why |
+|--------|----------------------------|-----|
+| Server | `max.file.size.mb`         | Raise it above your largest file |
+| Server | `transfer.timeout.seconds` | Raise it so the slowest expected transfer fits (default 600 seconds) |
+| Client | `socket.timeout.seconds`   | Raise it on slow links |
+
+The size limit applies to the data as sent too. Compression can't shrink data
+that is already compressed (such as ZIP files, videos or photos) and makes it
+slightly larger, so such a file just under the limit can be rejected.
+
+As a rough guide, tests on fast hardware reached about 18 to 30 MB/s end to end
+for data that doesn't compress, and much more for text, which compresses well.
+On a real network, the network speed usually sets the limit.
 
 ## Logging
 
@@ -240,6 +320,12 @@ Logs are written to `server/logs/server_jfiltra.log` and
 `client/logs/client_jfiltra.log`, and also printed to the console. Each log file
 rolls over at 10MB and keeps 10 backups. You can change this in
 `server/config/log4j2.properties` and `client/config/log4j2.properties`.
+
+Both log their version and settings at startup. During operation, the client logs
+one line per sent file, for example
+`File sent: report.pdf (12345 bytes, 0.40 s, SHA-256 ab12...)`. A missing source
+directory is logged once, and again when it is available. Network problems are
+logged in one line each, without a stack trace.
 
 Encryption keys are never written to the logs. Instead, server and client log a
 fingerprint of each key: the first 8 hex characters of its SHA-256 hash. The same
@@ -264,14 +350,20 @@ jFiltra is built for simple, reliable file exchange on trusted networks. It is
   knowing the key.
 
 To send files over an untrusted network, such as the internet, run jFiltra
-through a VPN or an SSH tunnel. For example, on the client machine:
+through a VPN or an SSH tunnel. For an SSH tunnel:
 
-```bash
-ssh -N -L 9000:localhost:9000 user@server-host
-```
+1. On the server, set `server.bind.address=127.0.0.1`, so the jFiltra port can't
+   be reached from the network at all.
+2. On the client machine, open the tunnel:
 
-and set `server.host=localhost` in `client.properties`. The SSH connection then
-encrypts and authenticates everything between client and server.
+   ```bash
+   ssh -N -L 9000:localhost:9000 user@server-host
+   ```
+
+3. Set `server.host=localhost` in `client.properties`.
+
+The SSH connection then encrypts and authenticates everything between client and
+server.
 
 Protection that jFiltra does provide:
 
@@ -295,7 +387,8 @@ Protection that jFiltra does provide:
 
 `test/smoke-test.sh` builds server and client, runs them in a temporary
 directory, and checks the main behaviours: delivery, skipped files and symbolic
-links, oversized files, wrong keys, duplicates, and placeholder keys. It needs
+links, oversized files, wrong keys, duplicates, retries, name conflicts, an
+unreachable server, startup errors, and that the JARs run on Java 8. It needs
 Java and the Log4j 2 JARs in `server/lib` and `client/lib`:
 
 ```bash
@@ -303,7 +396,18 @@ test/smoke-test.sh
 ```
 
 It prints `PASS` or `FAIL` for each check and exits with code `0` when all pass.
-The same test runs on GitHub for Java 8, 11, 17 and 21 on every push.
+To run server and client with a different Java, for example Java 8, set
+`JFILTRA_TEST_JAVA=/path/to/java`.
+
+The same test runs on GitHub on every push: on Java 8, 11, 17 and 21, and once
+with JARs built on Java 21 and run on Java 8.
+
+## Roadmap
+
+Ideas for later versions, kept out of 1.0 to keep jFiltra simple:
+
+- Scanning subdirectories of the source directories
+- Moving sent files to a `sent/` directory instead of deleting them
 
 ## Support this project
 
