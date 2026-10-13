@@ -1,6 +1,15 @@
 @echo off
 setlocal
 
+rem Use %JAVA_HOME%\bin when JAVA_HOME is set, otherwise the tools on the PATH
+set "JBIN="
+if defined JAVA_HOME set "JBIN=%JAVA_HOME%\bin\"
+"%JBIN%java" -version >nul 2>&1
+if errorlevel 1 (
+  echo Error: Java not found. Install OpenJDK 8 or newer ^(see README^) or set JAVA_HOME.
+  exit /b 1
+)
+
 rem Set variables (paths are relative to this script, wherever it is called from)
 for %%I in ("%~dp0..") do set "SERVER_DIR=%%~fI"
 set "LIB_DIR=%SERVER_DIR%\lib"
@@ -15,7 +24,7 @@ rem Display startup information
 echo Classpath: %JFILTRA_CP%
 echo Starting JFiltraServer with configuration: %CONFIG_FILE%
 echo ------------------------
-java -version
+"%JBIN%java" -version
 echo ------------------------
 
 rem Create log directory if it doesn't exist
@@ -25,4 +34,4 @@ rem Change to the server directory to make relative paths work
 cd /d "%SERVER_DIR%"
 
 rem Start the server
-java -Dlog4j2.configurationFile="%LOG4J_CONFIG%" -cp "%JFILTRA_CP%" server.JFiltraServer "%CONFIG_FILE%"
+"%JBIN%java" -Dlog4j2.configurationFile="%LOG4J_CONFIG%" -cp "%JFILTRA_CP%" server.JFiltraServer "%CONFIG_FILE%"

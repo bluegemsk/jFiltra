@@ -16,8 +16,8 @@ a VPN or SSH tunnel; see [Security notes](#security-notes).
 
 ## Requirements
 
-- Java 8 or newer, with `java` on your `PATH` (JDK for compiling, JRE for running).
-  The compile scripts always build JARs that run on Java 8, whatever JDK you build with.
+- Java 8 or newer: a JDK for compiling, a JDK or JRE for running. The compile scripts
+  always build JARs that run on Java 8, whatever JDK you build with. See [Java](#java).
 - Bash on Linux and macOS, or the Command Prompt on Windows (to run the scripts)
 - [Apache Log4j 2](https://logging.apache.org/log4j/2.x/) 2.26.1, placed in both `server/lib/` and `client/lib/`:
   - [`log4j-api-2.26.1.jar`](https://repo1.maven.org/maven2/org/apache/logging/log4j/log4j-api/2.26.1/log4j-api-2.26.1.jar)
@@ -33,6 +33,45 @@ for d in server/lib client/lib; do
   done
 done
 ```
+
+## Java
+
+jFiltra runs on OpenJDK. Any OpenJDK build works, for example your distribution's
+packages or [Eclipse Temurin](https://adoptium.net/).
+
+Tested OpenJDK versions (build, smoke test and functional tests):
+
+| Version | Tested build |
+|---------|--------------|
+| 8  | Temurin 1.8.0_504 |
+| 11 | Temurin 11.0.32.1 |
+| 17 | Temurin 17.0.20.1 |
+| 21 | OpenJDK 21.0.12.1 (Debian) |
+| 25 | OpenJDK 25.0.4.1 (Debian) |
+
+Install a JDK (use `-jre-headless` instead of `-jdk-headless` on hosts that only run jFiltra):
+
+```bash
+# Debian / Ubuntu (versions available depend on the release)
+sudo apt install openjdk-21-jdk-headless
+# RHEL / Rocky / AlmaLinux / Fedora
+sudo dnf install java-21-openjdk-devel        # RHEL 7: sudo yum install java-11-openjdk-devel
+# openSUSE
+sudo zypper install java-21-openjdk-devel
+# Alpine
+sudo apk add openjdk21-jdk
+```
+
+The scripts use `$JAVA_HOME/bin/java` (and `javac`, `jar`) when `JAVA_HOME` is set,
+otherwise `java` on the `PATH`. To pick a specific installed version:
+
+```bash
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64   # path depends on the distribution
+```
+
+The scripts stop with a clear message if Java is missing, older than Java 8, or
+(for compiling) only a JRE without `javac` is installed. On Windows they use
+`%JAVA_HOME%\bin` the same way.
 
 ## Project layout
 
