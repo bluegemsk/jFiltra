@@ -75,22 +75,33 @@ class_version() {
   unzip -p "$jar" "$class" | od -An -tu1 -j7 -N1 | tr -d ' '
 }
 
+echo "Unit tests"
+mkdir -p "$WORK/unit"
+JAVAC="javac"
+[ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/javac" ] && JAVAC="$JAVA_HOME/bin/javac"
+if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/client/lib/*" -d "$WORK/unit" "$ROOT/test/FileMaskTest.java" 2>/dev/null; then
+  check "filemask matcher unit tests" "$JAVA" -cp "$WORK/unit:$ROOT/client/lib/*" client.FileMaskTest
+else
+  check "filemask matcher unit tests compile" false
+fi
+
 echo "Build checks"
 check "server JAR runs on Java 8 (class version 52)" [ "$(class_version "$ROOT/server/lib/jfiltra-server.jar")" = "52" ]
 check "client JAR runs on Java 8 (class version 52)" [ "$(class_version "$ROOT/client/lib/jfiltra-client.jar")" = "52" ]
 
 # Copy built applications and configs into the temporary directory
-for side in server server-rename client client2 client3; do
+for side in server server-rename client client2 client3 client4; do
   src="${side%%[0-9-]*}"
   src="${src%-rename}"
   mkdir -p "$WORK/$side"
   cp -R "$ROOT/$src/lib" "$ROOT/$src/config" "$WORK/$side/"
 done
-mkdir -p "$WORK/src1" "$WORK/src2" "$WORK/src3" "$WORK/received/client3"
+mkdir -p "$WORK/src1" "$WORK/src2" "$WORK/src3" "$WORK/src4" "$WORK/received/client3"
 
 KEY1="$(random_key)"
 KEY2="$(random_key)"
 KEY3="$(random_key)"
+KEY4="$(random_key)"
 WRONG_KEY="$(random_key)"
 
 write_server_config() {
@@ -104,8 +115,8 @@ on.name.conflict=$3
 EOF
 }
 write_server_config "$WORK/server" "$PORT" reject
-printf 'client1=%s\nclient2=%s\n' "$KEY1" "$KEY2" > "$WORK/server/config/client_keys.properties"
-printf 'client1=%s\nclient2=%s\n' "$WORK/received/client1" "$WORK/received/client2" > "$WORK/server/config/client_paths.properties"
+printf 'client1=%s\nclient2=%s\nclient4=%s\n' "$KEY1" "$KEY2" "$KEY4" > "$WORK/server/config/client_keys.properties"
+printf 'client1=%s\nclient2=%s\nclient4=%s\n' "$WORK/received/client1" "$WORK/received/client2" "$WORK/received/client4" > "$WORK/server/config/client_paths.properties"
 write_server_config "$WORK/server-rename" "$RENAME_PORT" rename
 printf 'client3=%s\n' "$KEY3" > "$WORK/server-rename/config/client_keys.properties"
 printf 'client3=%s\n' "$WORK/received/client3" > "$WORK/server-rename/config/client_paths.properties"
@@ -124,6 +135,8 @@ EOF
 write_client_config "$WORK/client" client1 "$WORK/src1" "$KEY1" "$PORT"
 write_client_config "$WORK/client2" client2 "$WORK/src2" "$WRONG_KEY" "$PORT"
 write_client_config "$WORK/client3" client3 "$WORK/src3" "$KEY3" "$RENAME_PORT"
+write_client_config "$WORK/client4" client4 "$WORK/src4" "$KEY4" "$PORT"
+echo 'filemask=*.csv; report_??.TXT' >> "$WORK/client4/config/client.properties"
 
 start() {
   local dir="$1" class="$2" config="$3" jar="$4"
@@ -150,7 +163,19 @@ missing_exit=$?
 check "missing config file refused at startup" [ "$missing_exit" -eq 1 ]
 check "missing config message shows the full path" grep -q "Configuration file not found: /.*/client/config/missing.properties" "$WORK/client/missing.log"
 
+cp -R "$WORK/client4" "$WORK/client-badmask"
+echo 'filemask=sub/*.csv' >> "$WORK/client-badmask/config/client.properties"
+(cd "$WORK/client-badmask" && "$JAVA" -cp "lib/*" client.JFiltraClient config/client.properties > console.log 2>&1)
+badmask_exit=$?
+check "invalid filemask refused at startup" [ "$badmask_exit" -eq 1 ]
+check "invalid filemask message names the mask" grep -q "Invalid filemask 'sub/\*.csv'" "$WORK/client-badmask/console.log"
+
 # Files present before the clients start
+echo "a,b" > "$WORK/src4/data.csv"
+echo "upper" > "$WORK/src4/UPPER.CSV"
+echo "report" > "$WORK/src4/report_01.txt"
+echo "not matching" > "$WORK/src4/notes.txt"
+echo "not matching" > "$WORK/src4/report_001.txt"
 echo "hello jFiltra" > "$WORK/src1/normal.txt"
 echo "secret outside the source directory" > "$WORK/secret.txt"
 ln -s "$WORK/secret.txt" "$WORK/src1/link.txt"
@@ -163,6 +188,7 @@ start "$WORK/server" server.JFiltraServer server.properties jfiltra-server.jar
 wait_for 15 grep -q "Server is running" "$SERVER_LOG" 2>/dev/null || { echo "Server did not start"; cat "$WORK/server/console.log"; exit 1; }
 start "$WORK/client" client.JFiltraClient client.properties jfiltra-client.jar
 start "$WORK/client2" client.JFiltraClient client.properties jfiltra-client.jar
+start "$WORK/client4" client.JFiltraClient client.properties jfiltra-client.jar
 
 (cd "$WORK/server" && "$JAVA" -cp "lib/*" server.JFiltraServer config/server.properties > port-in-use.log 2>&1)
 in_use_exit=$?
@@ -189,6 +215,18 @@ check "oversized file sent only once" [ "$(count 'Rejected file big.bin' "$SERVE
 check "wrong key rejected with 'Decryption failed'" grep -q "Server rejected file wrongkey.txt: ERROR: Decryption failed" "$CLIENT2_LOG"
 check "wrong-key file not stored" [ ! -e "$WORK/received/client2/wrongkey.txt" ]
 check "wrong-key file kept in source" [ -f "$WORK/src2/wrongkey.txt" ]
+
+echo "File mask"
+R4="$WORK/received/client4"
+check "file matching the mask delivered" wait_for 15 [ -f "$R4/data.csv" ]
+check "mask matches ignoring case" wait_for 10 [ -f "$R4/UPPER.CSV" ]
+check "second mask after ';' applies" wait_for 10 [ -f "$R4/report_01.txt" ]
+check "matching files deleted from source" wait_for 5 [ ! -e "$WORK/src4/data.csv" ]
+check "non-matching file not sent" [ ! -e "$R4/notes.txt" ]
+check "'?' matches exactly one character" [ ! -e "$R4/report_001.txt" ]
+check "non-matching files left in source" [ -f "$WORK/src4/notes.txt" ] && [ -f "$WORK/src4/report_001.txt" ]
+check "client logs the configured mask" grep -q "File Mask: \*.csv; report_??.TXT" "$WORK/client4/logs/client_jfiltra.log"
+check "default mask sends everything (no filemask in client1 config)" grep -q "File Mask: \*$" "$CLIENT_LOG"
 
 echo "Duplicates"
 echo "same content" > "$WORK/src1/same.txt"

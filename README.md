@@ -87,6 +87,7 @@ client/
   src/main/java/client/   JFiltraClient.java
 test/
   smoke-test.sh           end-to-end test (see Testing)
+  FileMaskTest.java       unit tests for the filemask matcher, run by smoke-test.sh
 ```
 
 These folders are created when you set up, build and run jFiltra. They are not
@@ -150,7 +151,30 @@ stored in `server/incoming/`. The storage directory is created if it doesn't exi
 | `polling.interval.seconds` | No       | How often to scan the directories (default `10`; shipped value: `3`) |
 | `socket.timeout.seconds`   | No       | Seconds to wait for the server's response before retrying later (default `120`) |
 | `stable.polls`             | No       | Number of scans a file must stay unchanged before it is sent (default `2`) |
+| `filemask`                 | No       | File name masks of the files to send, separated by `,` or `;` (default `*`: all files). See [File mask](#file-mask) |
 | `ignore.patterns`          | No       | Comma-separated file name patterns that are never sent (default `.*,*.part,*.tmp,*.crdownload,~$*`; empty sends everything) |
+
+### File mask
+
+`filemask` limits which files the client sends. Example:
+
+```properties
+# Send only CSV files and files like report_01.txt
+filemask=*.csv; report_??.txt
+```
+
+- `*` matches any number of characters (also none), `?` exactly one character.
+  All other characters match themselves; there are no regular expressions.
+- Masks match the file name only, not the directory. A mask with `/` or `\`
+  is refused at startup with a clear error.
+- Matching ignores upper and lower case on every operating system:
+  `*.csv` also matches `DATA.CSV`.
+- A file is sent if it matches any of the masks. An empty value or `*` sends
+  all files, as without the setting.
+- `ignore.patterns` still applies: a file matching it is never sent, even if it
+  matches `filemask`.
+- Files that don't match stay in the source directory untouched. The client
+  logs them at debug level only.
 
 ### Keys
 
@@ -261,6 +285,8 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
   delete the file. Programs that write into a source directory should therefore
   write to a temporary name and rename the file when it is complete. Files ending
   in `.part` or `.tmp` are ignored by default for exactly this purpose.
+- Only files matching `filemask` are sent (default: all files); the others stay
+  in the source directory.
 - Files matching `ignore.patterns` are never sent. By default these are hidden
   files (starting with `.`), files ending in `.part`, `.tmp` or `.crdownload`, and
   Office lock files (starting with `~$`).
@@ -426,7 +452,7 @@ Protection that jFiltra does provide:
 
 `test/smoke-test.sh` builds server and client, runs them in a temporary
 directory, and checks the main behaviours: delivery, skipped files and symbolic
-links, oversized files, wrong keys, duplicates, retries, name conflicts, an
+links, the `filemask` setting (with unit tests of the matcher), oversized files, wrong keys, duplicates, retries, name conflicts, an
 unreachable server, startup errors, and that the JARs run on Java 8. It needs
 Java and the Log4j 2 JARs in `server/lib` and `client/lib`:
 

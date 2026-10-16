@@ -41,7 +41,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraClient {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.0.0";
+    private static final String VERSION = "1.0.1";
     
     // Initialize logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraClient.class);
@@ -59,6 +59,8 @@ public class JFiltraClient {
     private int stablePolls;                    // Scans a file must stay unchanged before it is sent
     private String ignorePatterns;              // File name patterns that are never sent
     private List<PathMatcher> ignoreMatchers;   // Compiled ignore patterns
+    private String fileMask;                    // File name masks of files to send
+    private List<String> fileMasks;             // Parsed file masks
     
     // Max wait when connecting to the server
     private static final int CONNECT_TIMEOUT_MILLIS = 10000;
@@ -180,6 +182,13 @@ public class JFiltraClient {
                 if (!pattern.trim().isEmpty()) {
                     ignoreMatchers.add(FileSystems.getDefault().getPathMatcher("glob:" + pattern.trim()));
                 }
+            }
+
+            // File name masks of files to send (default * sends every file)
+            fileMask = config.getProperty("filemask", "*").trim();
+            fileMasks = parseFileMasks(fileMask);
+            if (fileMask.isEmpty()) {
+                fileMask = "*";
             }
 
             // print environment info
@@ -335,6 +344,7 @@ public class JFiltraClient {
                     try (Stream<Path> entries = Files.list(dir)) {
                         entries.filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
                                .filter(file -> !isIgnored(file))
+                               .filter(this::matchesFileMask)
                                .forEach(files::add);
                     }
                     
@@ -355,6 +365,90 @@ public class JFiltraClient {
         } catch (Throwable t) {
             logger.error("Unexpected error while polling directories: " + t, t);
         }
+    }
+
+    /**
+     * Checks whether a file matches the filemask setting. Files that don't match stay
+     * in the source directory untouched.
+     *
+     * @param file The file to check
+     * @return true if the file may be sent
+     */
+    private boolean matchesFileMask(Path file) {
+        String name = file.getFileName().toString();
+        for (String mask : fileMasks) {
+            if (globMatches(mask, name)) {
+                return true;
+            }
+        }
+        logger.debug("Skipping file not matching filemask: " + name);
+        return false;
+    }
+
+    /**
+     * Parses the filemask setting: masks separated by commas or semicolons, spaces
+     * around them ignored. An empty value means every file.
+     *
+     * @param value The setting's value
+     * @return The masks, never empty
+     * @throws IllegalArgumentException if a mask contains a path separator or a control character
+     */
+    static List<String> parseFileMasks(String value) {
+        List<String> masks = new ArrayList<>();
+        for (String mask : value.split("[,;]")) {
+            mask = mask.trim();
+            if (mask.isEmpty()) {
+                continue;
+            }
+            for (int i = 0; i < mask.length(); i++) {
+                char c = mask.charAt(i);
+                if (c == '/' || c == '\\' || Character.isISOControl(c)) {
+                    throw new IllegalArgumentException("Invalid filemask '" + mask
+                            + "': masks match file names only, use * and ? without paths");
+                }
+            }
+            masks.add(mask);
+        }
+        if (masks.isEmpty()) {
+            masks.add("*");
+        }
+        return masks;
+    }
+
+    /**
+     * Matches a file name against a mask with the wildcards * (any characters, also
+     * none) and ? (exactly one character). All other characters match themselves,
+     * ignoring case. Runs in linear time for any input (no regular expressions).
+     *
+     * @param mask The mask, for example *.csv or report_????.txt
+     * @param name The file name
+     * @return true if the name matches the mask
+     */
+    static boolean globMatches(String mask, String name) {
+        int m = 0, n = 0, starM = -1, starN = 0;
+        while (n < name.length()) {
+            if (m < mask.length() && mask.charAt(m) == '*') {
+                starM = m++;
+                starN = n;
+            } else if (m < mask.length() && (mask.charAt(m) == '?' || sameIgnoreCase(mask.charAt(m), name.charAt(n)))) {
+                m++;
+                n++;
+            } else if (starM >= 0) {
+                m = starM + 1;
+                n = ++starN;
+            } else {
+                return false;
+            }
+        }
+        while (m < mask.length() && mask.charAt(m) == '*') {
+            m++;
+        }
+        return m == mask.length();
+    }
+
+    private static boolean sameIgnoreCase(char a, char b) {
+        return a == b || Character.toLowerCase(a) == Character.toLowerCase(b)
+                || Character.toUpperCase(a) == Character.toUpperCase(b);
     }
 
     /**
@@ -681,6 +775,7 @@ public class JFiltraClient {
         logger.info("Polling Interval: " + pollingIntervalSeconds + " seconds");
         logger.info("Socket Timeout: " + socketTimeoutSeconds + " seconds");
         logger.info("Stable Polls: " + stablePolls);
+        logger.info("File Mask: " + fileMask);
         logger.info("Ignore Patterns: " + (ignorePatterns.isEmpty() ? "(none)" : ignorePatterns));
         logger.info("-----------------------------------------");
         try {
