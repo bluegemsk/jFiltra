@@ -14,6 +14,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -29,8 +30,6 @@ import java.nio.file.StandardOpenOption;
 import java.security.DigestOutputStream;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.Locale;
@@ -68,7 +67,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraServer {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.0.0";
+    private static final String VERSION = "1.0.2";
     
     // Logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraServer.class);
@@ -90,9 +89,9 @@ public class JFiltraServer {
     private int maxConnectionsPerIp;     // Max simultaneous connections from one IP address
     private long maxFileSizeBytes;       // Max size of a transferred file (sent and uncompressed)
     
-    // What to do when a file with the same name but different content is already stored:
-    // false = reject it (the client retries later), true = store it under a new name
-    private boolean renameOnConflict;
+    // What to do when a file with the same name is already stored (on.name.conflict):
+    // reject, rename (default), overwrite or append
+    private String onNameConflict;
     
     // Thread pool for handling multiple client connections
     private ExecutorService executor;
@@ -105,6 +104,14 @@ public class JFiltraServer {
     
     // Guards the fallback publish path on file systems without hard links
     private final Object publishLock = new Object();
+
+    // Serialize appends per target name (striped, so the lock count stays fixed)
+    private final Object[] appendLocks = new Object[64];
+    {
+        for (int i = 0; i < appendLocks.length; i++) {
+            appendLocks[i] = new Object();
+        }
+    }
     
     // Windows reserved device names; rejected so stored files stay usable on Windows
     private static final Pattern WINDOWS_RESERVED_NAME =
@@ -158,12 +165,8 @@ public class JFiltraServer {
                 throw new IllegalArgumentException("Setting server.bind.address is not a valid address: " + bind);
             }
             
-            // Same name, different content: reject (default) or store under a new name
-            String conflict = config.getProperty("on.name.conflict", "reject").trim().toLowerCase(Locale.ROOT);
-            if (!conflict.equals("reject") && !conflict.equals("rename")) {
-                throw new IllegalArgumentException("Setting on.name.conflict must be reject or rename, but is: " + conflict);
-            }
-            renameOnConflict = conflict.equals("rename");
+            // Name already stored: rename (default), overwrite, append or reject
+            onNameConflict = parseOnNameConflict(config.getProperty("on.name.conflict"));
             
             // Load client encryption keys from separate file for better security
             String clientKeysPath = config.getProperty("client.keys.path");
@@ -181,7 +184,7 @@ public class JFiltraServer {
             logger.info("-----------------------------------------");
             logger.info("Version: " + VERSION);
             logger.info("Bind Address: " + (bindAddress == null ? "all interfaces" : bindAddress.getHostAddress()));
-            logger.info("On Name Conflict: " + (renameOnConflict ? "rename" : "reject"));
+            logger.info("On Name Conflict: " + onNameConflict);
             logger.info("Socket Timeout: " + socketTimeoutSeconds + " seconds");
             logger.info("Header Timeout: " + headerTimeoutSeconds + " seconds");
             logger.info("Transfer Timeout: " + transferTimeoutSeconds + " seconds");
@@ -616,16 +619,15 @@ public class JFiltraServer {
                 return;
             }
 
-            // Never overwrite an existing file. If it has the same content, or conflicts are
-            // rejected, there is no need to store the upload to answer.
-            if (destinationFile.exists()) {
+            // Name already taken: with the same content (e.g. the client missed the earlier
+            // reply), or with reject, answer without storing the upload. Append always appends.
+            if (!onNameConflict.equals("append") && destinationFile.exists()) {
                 boolean identical = existingFileMatches(destinationFile, fileHash);
-                if (identical || !renameOnConflict) {
+                if (identical || onNameConflict.equals("reject")) {
                     new LimitedInputStream(dis, fileSize).skipRemaining();
                     respondToNameConflict(dos, identical, destinationFile, clientLabel);
                     return;
                 }
-                // on.name.conflict=rename: receive the file and store it under a new name below
             }
             
             // Receive, decrypt, decompress and hash the file in one pass, writing it to a
@@ -644,11 +646,18 @@ public class JFiltraServer {
             
             long fileSizeReceived = Files.size(partFile);
             
-            // Publish under the real name; fails if the name is taken (in rename mode, or
-            // because another transfer stored the name meanwhile)
-            if (!publishFile(partFile, destinationFile.toPath())) {
+            // Publish only now, after the whole file was received and verified
+            if (onNameConflict.equals("overwrite")) {
+                replaceFile(partFile, destinationFile.toPath());
+            } else if (onNameConflict.equals("append")) {
+                if (appendFile(partFile, destinationFile.toPath())) {
+                    logger.info("File " + originalFileName + " already exists; appended " + fileSizeReceived
+                            + " bytes (client: " + clientLabel + ")");
+                }
+            } else if (!publishFile(partFile, destinationFile.toPath())) {
+                // Name taken (also by a transfer that finished meanwhile)
                 boolean identical = existingFileMatches(destinationFile, fileHash);
-                if (identical || !renameOnConflict) {
+                if (identical || onNameConflict.equals("reject")) {
                     respondToNameConflict(dos, identical, destinationFile, clientLabel);
                     return;
                 }
@@ -840,9 +849,46 @@ public class JFiltraServer {
     }
 
     /**
-     * Publishes a file under a new name when its name is taken by a file with different
-     * content (on.name.conflict=rename). The new name adds the date and time before the
-     * extension, e.g. export_20261012-150012.csv, and a counter if needed.
+     * Parses on.name.conflict: reject, rename, overwrite or append, ignoring case.
+     * Missing or empty means rename.
+     *
+     * @param value The setting's value (may be null)
+     * @return The mode in lower case
+     * @throws IllegalArgumentException If the value is not one of the modes
+     */
+    static String parseOnNameConflict(String value) {
+        String mode = (value == null) ? "" : value.trim().toLowerCase(Locale.ROOT);
+        if (mode.isEmpty()) {
+            return "rename";
+        }
+        if (!mode.equals("rename") && !mode.equals("overwrite") && !mode.equals("append") && !mode.equals("reject")) {
+            throw new IllegalArgumentException("Setting on.name.conflict must be rename, overwrite, append or reject, but is: "
+                    + value.trim());
+        }
+        return mode;
+    }
+
+    /**
+     * Builds the n-th alternative name for a taken file name: the number goes before
+     * the last extension, e.g. report.csv -> report_1.csv, archive.tar.gz ->
+     * archive.tar_1.gz, README -> README_1, .profile -> .profile_1.
+     *
+     * @param fileName The original file name
+     * @param n The number to add (1 or more)
+     * @return The new name
+     */
+    static String numberedName(String fileName, int n) {
+        int dot = fileName.lastIndexOf('.');
+        if (dot <= 0) {
+            return fileName + "_" + n;
+        }
+        return fileName.substring(0, dot) + "_" + n + fileName.substring(dot);
+    }
+
+    /**
+     * Publishes a file under the lowest free numbered name (see numberedName) when its
+     * name is taken (on.name.conflict=rename). Each attempt is atomic, so parallel
+     * transfers of the same name always get different names.
      * 
      * @param partFile The fully written temporary file in the storage directory
      * @param storageDir The client's storage directory
@@ -851,14 +897,8 @@ public class JFiltraServer {
      * @throws IOException If the file cannot be published
      */
     private File publishUnderNewName(Path partFile, File storageDir, String fileName) throws IOException {
-        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
-        int dot = fileName.lastIndexOf('.');
-        String base = (dot > 0) ? fileName.substring(0, dot) : fileName;
-        String extension = (dot > 0) ? fileName.substring(dot) : "";
-        
-        for (int i = 1; i <= 100; i++) {
-            String candidate = base + "_" + timestamp + (i > 1 ? "_" + i : "") + extension;
-            File target = resolveSafeDestination(storageDir, candidate);
+        for (int i = 1; i <= 100000; i++) {
+            File target = resolveSafeDestination(storageDir, numberedName(fileName, i));
             if (target == null) {
                 return null; // e.g. the new name would be too long
             }
@@ -867,6 +907,68 @@ public class JFiltraServer {
             }
         }
         return null;
+    }
+
+    /**
+     * Stores a fully written file under its name, replacing an existing file in one
+     * atomic rename (on.name.conflict=overwrite). Readers see either the old or the new
+     * file, never a mix; of parallel transfers the last one wins. A symbolic link with
+     * this name is replaced itself, its target is never written.
+     *
+     * @param partFile The fully written temporary file in the storage directory
+     * @param target The final file name
+     * @throws IOException If the file cannot be stored, e.g. the name is a directory
+     */
+    private void replaceFile(Path partFile, Path target) throws IOException {
+        if (Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("Cannot overwrite directory " + target);
+        }
+        try {
+            Files.move(partFile, target, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(partFile, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    /**
+     * Appends a fully written file to an existing file of the same name, or stores it
+     * if there is none (on.name.conflict=append). Appends to the same name are done one
+     * at a time, so data of parallel transfers never interleaves. Only regular files are
+     * appended to; symbolic links are never followed.
+     *
+     * @param partFile The fully written temporary file in the storage directory
+     * @param target The final file name
+     * @return true if appended, false if stored as a new file
+     * @throws IOException If the file cannot be stored
+     */
+    private boolean appendFile(Path partFile, Path target) throws IOException {
+        Object lock = appendLocks[(target.toAbsolutePath().normalize().hashCode() & 0x7fffffff) % appendLocks.length];
+        synchronized (lock) {
+            if (publishFile(partFile, target)) {
+                return false;
+            }
+            if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("Cannot append to " + target + ": not a regular file");
+            }
+            try (FileChannel out = FileChannel.open(target, StandardOpenOption.WRITE, StandardOpenOption.APPEND,
+                         LinkOption.NOFOLLOW_LINKS);
+                 FileChannel in = FileChannel.open(partFile, StandardOpenOption.READ)) {
+                long originalSize = out.size();
+                try {
+                    long size = in.size();
+                    long done = 0;
+                    while (done < size) {
+                        done += in.transferTo(done, size - done, out);
+                    }
+                    out.force(true);
+                } catch (IOException e) {
+                    // E.g. disk full: remove the partly appended data, keep the file as it was
+                    out.truncate(originalSize);
+                    throw e;
+                }
+            }
+            return true;
+        }
     }
 
     /**

@@ -88,6 +88,8 @@ client/
 test/
   smoke-test.sh           end-to-end test (see Testing)
   FileMaskTest.java       unit tests for the filemask matcher, run by smoke-test.sh
+  NameConflictTest.java   unit tests for on.name.conflict, run by smoke-test.sh
+  ParallelSendTest.java   parallel uploads of one name, run by smoke-test.sh
 ```
 
 These folders are created when you set up, build and run jFiltra. They are not
@@ -115,7 +117,7 @@ committed to git:
 | `max.connections`     | No       | Maximum transfers handled at the same time (default `10`)  |
 | `max.connections.per.ip` | No    | Maximum simultaneous connections from one IP address (default `4`); raise it when many clients share one IP address, for example on one host or behind NAT |
 | `max.file.size.mb`    | No       | Largest file accepted, both as sent and after decompression (default `512`) |
-| `on.name.conflict`    | No       | What to do when a file with the same name but different content is already stored: `reject` (default) or `rename`; see [Name conflicts](#name-conflicts) |
+| `on.name.conflict`    | No       | What to do when a file with the same name is already stored: `rename` (default), `overwrite`, `append` or `reject` (upper/lower case doesn't matter); see [Name conflicts](#name-conflicts) |
 
 Relative paths are resolved from the `server/` folder, because the start script
 runs the server from there. Leaving out `client.keys.path` means no keys are
@@ -297,10 +299,11 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
 - When the server rejects a file, the client logs the reason, for example
   `Server rejected file report.pdf: ERROR: File already exists`. The server log
   has the details. A wrong key is reported as `ERROR: Decryption failed`.
-- Existing files on the server are never overwritten, even when two transfers of
-  the same name arrive at the same time.
-- If a file with the same name **and the same content** is already stored, the
-  transfer counts as successful and the client deletes its copy. This happens,
+- Existing files on the server are never overwritten unless
+  `on.name.conflict=overwrite`, even when two transfers of the same name arrive
+  at the same time.
+- If a file with the same name **and the same content** is already stored
+  (in all modes except `append`), the transfer counts as successful and the client deletes its copy. This happens,
   for example, when the client missed the server's reply and sends the file again.
 - If a file with the same name but **different content** is already stored, see
   [Name conflicts](#name-conflicts).
@@ -344,20 +347,36 @@ every poll:
 ### Name conflicts
 
 `on.name.conflict` on the server decides what happens when a client sends a file
-whose name is already taken by a file with **different content**:
+whose name is already taken in the client's storage directory. The value is not
+case-sensitive (`Rename`, `RENAME` and `rename` are the same); any other value
+stops the server at startup with an error.
 
-- `reject` (default): the stored file is kept, and the new file stays on the
-  client. The client retries with growing delays (see [Retries](#retries)) until
-  someone moves or renames the stored file.
-- `rename`: the new file is stored under a new name with the date and time
-  added, for example `export_20261012-150012.csv`, and the client deletes its
-  copy. This suits files that arrive under the same name again and again, such as
-  a daily `export.csv`. In the rare case that the client misses the server's
-  reply, it sends the file again, and it is then stored a second time under
-  another new name.
+- `rename` (default): the new file is stored under the name with the lowest free
+  number added before the last extension: `report.csv` becomes `report_1.csv`,
+  then `report_2.csv`, and so on. `archive.tar.gz` becomes `archive.tar_1.gz`,
+  and a name without an extension such as `README` becomes `README_1`. The client
+  deletes its copy. This suits files that arrive under the same name again and
+  again, such as a daily `export.csv`. Parallel transfers of one name always get
+  different names; none is lost. If the client misses the server's reply, it
+  sends the file again, and it is then stored a second time under the next number.
+- `overwrite`: the new file replaces the stored one. The replacement is a single
+  atomic rename of the fully received file, so other programs see either the old
+  or the new file, never a mix. Of parallel transfers of one name, the last one
+  to finish wins.
+- `append`: the new file's content is added to the end of the stored file (or
+  stored as a new file if there is none). Data is appended only after the whole
+  file was received and verified, and appends to the same name are done one at a
+  time, so parallel transfers never mix their data. If appending fails (for
+  example the disk is full), the partly appended data is removed. Note: if the
+  client misses the server's reply, it sends the file again and the content is
+  appended twice.
+- `reject`: the stored file is kept, and the new file stays on the client. The
+  client retries with growing delays (see [Retries](#retries)) until someone
+  moves or renames the stored file. This was the default before version 1.0.2.
 
-Files with the same name **and the same content** are never stored twice in
-either mode.
+With `rename`, `overwrite` and `reject`, a file with the same name **and the same
+content** as the stored one is not stored again; the transfer counts as
+successful. With `append`, every transfer is appended.
 
 ### Large files
 
@@ -452,7 +471,8 @@ Protection that jFiltra does provide:
 
 `test/smoke-test.sh` builds server and client, runs them in a temporary
 directory, and checks the main behaviours: delivery, skipped files and symbolic
-links, the `filemask` setting (with unit tests of the matcher), oversized files, wrong keys, duplicates, retries, name conflicts, an
+links, the `filemask` setting, every `on.name.conflict` mode (including 20
+parallel uploads of one name) (with unit tests of the matcher), oversized files, wrong keys, duplicates, retries, name conflicts, an
 unreachable server, startup errors, and that the JARs run on Java 8. It needs
 Java and the Log4j 2 JARs in `server/lib` and `client/lib`:
 

@@ -84,6 +84,11 @@ if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/client/lib/*" -d "$WORK/unit"
 else
   check "filemask matcher unit tests compile" false
 fi
+if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/server/lib/*" -d "$WORK/unit" "$ROOT/test/NameConflictTest.java" "$ROOT/test/ParallelSendTest.java" 2>/dev/null; then
+  check "on.name.conflict unit tests" "$JAVA" -cp "$WORK/unit:$ROOT/server/lib/*" server.NameConflictTest
+else
+  check "on.name.conflict unit tests compile" false
+fi
 
 echo "Build checks"
 check "server JAR runs on Java 8 (class version 52)" [ "$(class_version "$ROOT/server/lib/jfiltra-server.jar")" = "52" ]
@@ -111,8 +116,10 @@ server.bind.address=127.0.0.1
 client.keys.path=config/client_keys.properties
 client.paths.config=config/client_paths.properties
 max.file.size.mb=1
-on.name.conflict=$3
+max.connections=25
+max.connections.per.ip=25
 EOF
+  [ -n "$3" ] && echo "on.name.conflict=$3" >> "$1/config/server.properties"
 }
 write_server_config "$WORK/server" "$PORT" reject
 printf 'client1=%s\nclient2=%s\nclient4=%s\n' "$KEY1" "$KEY2" "$KEY4" > "$WORK/server/config/client_keys.properties"
@@ -250,12 +257,44 @@ echo "today's export" > "$WORK/src3/export.csv"
 start "$WORK/server-rename" server.JFiltraServer server.properties jfiltra-server.jar
 wait_for 15 grep -q "Server is running" "$WORK/server-rename/logs/server_jfiltra.log" 2>/dev/null
 start "$WORK/client3" client.JFiltraClient client.properties jfiltra-client.jar
-renamed_file() { ls "$WORK/received/client3" | grep '^export_[0-9]\{8\}-[0-9]\{6\}\.csv$' | head -1; }
+renamed_file() { ls "$WORK/received/client3" | grep '^export_1\.csv$' | head -1; }
 has_renamed_file() { [ -n "$(renamed_file)" ]; }
 check "same name with different content stored under a new name" wait_for 15 has_renamed_file
 check "renamed file has the new content" cmp -s "$WORK/received/client3/$(renamed_file)" <(echo "today's export")
 check "existing file left unchanged" cmp -s "$WORK/received/client3/export.csv" <(echo "yesterday's export")
 check "source deleted after storing under a new name" wait_for 5 [ ! -e "$WORK/src3/export.csv" ]
+
+echo "Name conflict: invalid value, default and parallel uploads"
+MODE_PORT=$((PORT + 2))
+KEYP="$(random_key)"
+mkdir -p "$WORK/server-mode"
+cp -R "$ROOT/server/lib" "$ROOT/server/config" "$WORK/server-mode/"
+printf 'parallel=%s\n' "$KEYP" > "$WORK/server-mode/config/client_keys.properties"
+write_server_config "$WORK/server-mode" "$MODE_PORT" Replace
+(cd "$WORK/server-mode" && "$JAVA" -cp "lib/*" server.JFiltraServer config/server.properties > invalid.log 2>&1)
+invalid_exit=$?
+check "invalid on.name.conflict refused at startup" [ "$invalid_exit" -eq 1 ]
+check "invalid on.name.conflict message lists the values" grep -q "on.name.conflict must be rename, overwrite, append or reject, but is: Replace" "$WORK/server-mode/invalid.log"
+MODE_LOG="$WORK/server-mode/logs/server_jfiltra.log"
+for mode in "" OVERWRITE Append; do
+  expect="$(echo "${mode:-rename}" | tr 'A-Z' 'a-z')"
+  rm -rf "$WORK/received/parallel" "$WORK/server-mode/logs"
+  mkdir -p "$WORK/received/parallel"
+  printf 'parallel=%s\n' "$WORK/received/parallel" > "$WORK/server-mode/config/client_paths.properties"
+  write_server_config "$WORK/server-mode" "$MODE_PORT" "$mode"
+  start "$WORK/server-mode" server.JFiltraServer server.properties jfiltra-server.jar
+  wait_for 15 grep -q "Server is running" "$MODE_LOG" 2>/dev/null
+  if [ -z "$mode" ]; then
+    check "default on.name.conflict is rename" grep -q "On Name Conflict: rename" "$MODE_LOG"
+  else
+    check "on.name.conflict=$mode accepted ignoring case" grep -q "On Name Conflict: $expect" "$MODE_LOG"
+  fi
+  check "$expect: 20 parallel uploads of one name" "$JAVA" -cp "$WORK/unit" ParallelSendTest "$MODE_PORT" parallel "$KEYP" "$WORK/received/parallel" "$expect" 20
+  last=$((${#PIDS[@]} - 1))
+  kill "${PIDS[$last]}" 2>/dev/null
+  wait "${PIDS[$last]}" 2>/dev/null
+  PIDS[$last]=""
+done
 
 echo "Server down"
 kill "${PIDS[0]}" 2>/dev/null
