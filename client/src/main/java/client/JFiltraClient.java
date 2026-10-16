@@ -41,7 +41,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraClient {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.0.2";
+    private static final String VERSION = "1.0.3";
     
     // Initialize logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraClient.class);
@@ -61,6 +61,16 @@ public class JFiltraClient {
     private List<PathMatcher> ignoreMatchers;   // Compiled ignore patterns
     private String fileMask;                    // File name masks of files to send
     private List<String> fileMasks;             // Parsed file masks
+    private boolean runOnce;                    // run.mode=once: send one file and exit
+    private String fileOrder;                   // file.order: time, size or name, ! reverses
+    private Comparator<Candidate> fileComparator; // Order in which files are sent
+    private boolean lastFileSent;               // Whether the last processFile call succeeded
+
+    // Exit codes of run.mode=once (1 is also used for configuration errors in both modes)
+    static final int EXIT_SENT = 0;
+    static final int EXIT_CONFIG_ERROR = 1;
+    static final int EXIT_NOTHING_TO_SEND = 2;
+    static final int EXIT_TRANSFER_FAILED = 3;
     
     // Max wait when connecting to the server
     private static final int CONNECT_TIMEOUT_MILLIS = 10000;
@@ -190,6 +200,21 @@ public class JFiltraClient {
             if (fileMask.isEmpty()) {
                 fileMask = "*";
             }
+
+            // Run continuously (default) or send one file and exit
+            String mode = config.getProperty("run.mode", "loop").trim().toLowerCase(Locale.ROOT);
+            if (!mode.isEmpty() && !mode.equals("loop") && !mode.equals("once")) {
+                throw new IllegalArgumentException("Setting run.mode must be loop or once, but is: "
+                        + config.getProperty("run.mode").trim());
+            }
+            runOnce = mode.equals("once");
+
+            // Order in which files are sent (default time: oldest first)
+            fileOrder = config.getProperty("file.order", "time").trim();
+            if (fileOrder.isEmpty()) {
+                fileOrder = "time";
+            }
+            fileComparator = parseFileOrder(fileOrder);
 
             // print environment info
             printEnvironmentInfo();
@@ -322,6 +347,7 @@ public class JFiltraClient {
             logger.debug("Scanning directories for files to send");
             
             Map<Path, FileState> currentStates = new HashMap<>();
+            List<Candidate> candidates = new ArrayList<>();
            
             for (String dirPath : sourceDirs) {
                 try {
@@ -340,21 +366,17 @@ public class JFiltraClient {
                     // Close the directory listing after use, otherwise every scan leaks a file handle.
                     // Symbolic links are skipped: following them would send (and then delete the
                     // link to) any file the client can read, such as files outside the source directory.
-                    List<Path> files = new ArrayList<>();
-                    try (Stream<Path> entries = Files.list(dir)) {
-                        entries.filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
-                               .filter(file -> !isIgnored(file))
-                               .filter(this::matchesFileMask)
-                               .forEach(files::add);
-                    }
-                    
-                    for (Path file : files) {
-                        processIfStable(file, currentStates);
-                    }
+                    candidates.addAll(listCandidates(dir));
                 } catch (Exception e) {
                     logger.error("Error polling directory " + dirPath + ": " + e.getMessage(), e);
                    
                 }
+            }
+            
+            // Send in the order of file.order, across all source directories
+            candidates.sort(fileComparator);
+            for (Candidate candidate : candidates) {
+                processIfStable(candidate.path, currentStates);
             }
             
             previousStates = currentStates;
@@ -364,6 +386,140 @@ public class JFiltraClient {
             retries.keySet().retainAll(currentStates.keySet());
         } catch (Throwable t) {
             logger.error("Unexpected error while polling directories: " + t, t);
+        }
+    }
+
+    /**
+     * A file found in a source directory, with the attributes used to order files.
+     */
+    static class Candidate {
+        final Path path;
+        final String name;
+        final long size;
+        final long modified;
+
+        Candidate(Path path, long size, long modified) {
+            this.path = path;
+            this.name = path.getFileName().toString();
+            this.size = size;
+            this.modified = modified;
+        }
+    }
+
+    /**
+     * Lists the files in a directory that may be sent: regular files (no symbolic links)
+     * that match filemask and no ignore pattern.
+     *
+     * @param dir The source directory
+     * @return The files with their size and modification time
+     * @throws IOException If the directory cannot be listed
+     */
+    private List<Candidate> listCandidates(Path dir) throws IOException {
+        // Close the directory listing after use, otherwise every scan leaks a file handle.
+        // Symbolic links are skipped: following them would send (and then delete the
+        // link to) any file the client can read, such as files outside the source directory.
+        List<Path> files = new ArrayList<>();
+        try (Stream<Path> entries = Files.list(dir)) {
+            entries.filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
+                   .filter(file -> !isIgnored(file))
+                   .filter(this::matchesFileMask)
+                   .forEach(files::add);
+        }
+        List<Candidate> candidates = new ArrayList<>();
+        for (Path file : files) {
+            try {
+                BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                candidates.add(new Candidate(file, attrs.size(), attrs.lastModifiedTime().toMillis()));
+            } catch (NoSuchFileException e) {
+                // Removed meanwhile
+            }
+        }
+        return candidates;
+    }
+
+    /**
+     * Parses file.order: time (oldest first), size (smallest first) or name (A to Z by
+     * character code), ignoring case; a leading ! reverses the order. Files that are
+     * equal by the chosen key are ordered by name, A to Z, so the order is always the same.
+     *
+     * @param value The setting's value
+     * @return The comparator
+     * @throws IllegalArgumentException If the value is not valid
+     */
+    static Comparator<Candidate> parseFileOrder(String value) {
+        String key = value.trim();
+        boolean reverse = key.startsWith("!");
+        if (reverse) {
+            key = key.substring(1).trim();
+        }
+        Comparator<Candidate> byName = (a, b) -> a.name.compareTo(b.name);
+        Comparator<Candidate> order;
+        switch (key.toLowerCase(Locale.ROOT)) {
+            case "time":
+                order = (a, b) -> Long.compare(a.modified, b.modified);
+                break;
+            case "size":
+                order = (a, b) -> Long.compare(a.size, b.size);
+                break;
+            case "name":
+                order = byName;
+                break;
+            default:
+                throw new IllegalArgumentException("Setting file.order must be time, size or name, optionally with a leading ! to reverse, but is: " + value.trim());
+        }
+        if (reverse) {
+            order = order.reversed();
+        }
+        return order.thenComparing(byName);
+    }
+
+    /**
+     * run.mode=once: scans the source directories once, sends the first file in
+     * file.order and returns. A file that changes during a short check (1 second) is
+     * still being written and is skipped. There is one attempt, no retries.
+     *
+     * @return The exit code: EXIT_SENT, EXIT_NOTHING_TO_SEND or EXIT_TRANSFER_FAILED
+     */
+    public int runOnce() {
+        try {
+            List<Candidate> candidates = new ArrayList<>();
+            for (String dirPath : sourceDirs) {
+                Path dir = Paths.get(dirPath);
+                if (!Files.isDirectory(dir)) {
+                    logger.warn("Directory does not exist: " + dirPath);
+                    continue;
+                }
+                candidates.addAll(listCandidates(dir));
+            }
+            candidates.sort(fileComparator);
+            if (candidates.isEmpty()) {
+                logger.info("No file to send");
+                return EXIT_NOTHING_TO_SEND;
+            }
+            
+            // Files still being written change within a second; skip them
+            Thread.sleep(1000);
+            for (Candidate candidate : candidates) {
+                String snapshot;
+                try {
+                    snapshot = fileSnapshot(candidate.path);
+                } catch (NoSuchFileException e) {
+                    continue;
+                }
+                if (!snapshot.equals(candidate.size + ":" + candidate.modified)) {
+                    logger.info("Skipping file still being written: " + candidate.name);
+                    continue;
+                }
+                logger.info("Sending one file (file.order=" + fileOrder + "): " + candidate.name);
+                lastFileSent = false;
+                processFile(candidate.path, snapshot);
+                return lastFileSent ? EXIT_SENT : EXIT_TRANSFER_FAILED;
+            }
+            logger.info("No file to send (all files are still being written)");
+            return EXIT_NOTHING_TO_SEND;
+        } catch (Exception e) {
+            logger.error("Error in one-time run: " + e, e);
+            return EXIT_TRANSFER_FAILED;
         }
     }
 
@@ -579,6 +735,7 @@ public class JFiltraClient {
                 try {
                     Files.delete(filePath);
                     retries.remove(filePath);
+                    lastFileSent = true;
                 } catch (IOException e) {
                     // Delivered, but it would be sent again on every poll: retry with growing delays
                     logger.error("File " + fileName + " was delivered but can't be deleted: " + e);
@@ -775,6 +932,8 @@ public class JFiltraClient {
         logger.info("Polling Interval: " + pollingIntervalSeconds + " seconds");
         logger.info("Socket Timeout: " + socketTimeoutSeconds + " seconds");
         logger.info("Stable Polls: " + stablePolls);
+        logger.info("Run Mode: " + (runOnce ? "once" : "loop"));
+        logger.info("File Order: " + fileOrder);
         logger.info("File Mask: " + fileMask);
         logger.info("Ignore Patterns: " + (ignorePatterns.isEmpty() ? "(none)" : ignorePatterns));
         logger.info("-----------------------------------------");
@@ -817,6 +976,12 @@ public class JFiltraClient {
         
         String configPath = args[0];
         JFiltraClient client = new JFiltraClient(configPath);
+
+        if (client.runOnce) {
+            int exitCode = client.runOnce();
+            logger.info("JFiltraClient finished one-time run, exit code " + exitCode);
+            System.exit(exitCode);
+        }
 
         client.start();
         

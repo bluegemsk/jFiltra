@@ -79,8 +79,9 @@ echo "Unit tests"
 mkdir -p "$WORK/unit"
 JAVAC="javac"
 [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/javac" ] && JAVAC="$JAVA_HOME/bin/javac"
-if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/client/lib/*" -d "$WORK/unit" "$ROOT/test/FileMaskTest.java" 2>/dev/null; then
+if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/client/lib/*" -d "$WORK/unit" "$ROOT/test/FileMaskTest.java" "$ROOT/test/FileOrderTest.java" 2>/dev/null; then
   check "filemask matcher unit tests" "$JAVA" -cp "$WORK/unit:$ROOT/client/lib/*" client.FileMaskTest
+  check "file.order unit tests" "$JAVA" -cp "$WORK/unit:$ROOT/client/lib/*" client.FileOrderTest
 else
   check "filemask matcher unit tests compile" false
 fi
@@ -95,7 +96,7 @@ check "server JAR runs on Java 8 (class version 52)" [ "$(class_version "$ROOT/s
 check "client JAR runs on Java 8 (class version 52)" [ "$(class_version "$ROOT/client/lib/jfiltra-client.jar")" = "52" ]
 
 # Copy built applications and configs into the temporary directory
-for side in server server-rename client client2 client3 client4; do
+for side in server server-rename client client2 client3 client4 client5; do
   src="${side%%[0-9-]*}"
   src="${src%-rename}"
   mkdir -p "$WORK/$side"
@@ -107,6 +108,7 @@ KEY1="$(random_key)"
 KEY2="$(random_key)"
 KEY3="$(random_key)"
 KEY4="$(random_key)"
+KEY5="$(random_key)"
 WRONG_KEY="$(random_key)"
 
 write_server_config() {
@@ -122,8 +124,8 @@ EOF
   [ -n "$3" ] && echo "on.name.conflict=$3" >> "$1/config/server.properties"
 }
 write_server_config "$WORK/server" "$PORT" reject
-printf 'client1=%s\nclient2=%s\nclient4=%s\n' "$KEY1" "$KEY2" "$KEY4" > "$WORK/server/config/client_keys.properties"
-printf 'client1=%s\nclient2=%s\nclient4=%s\n' "$WORK/received/client1" "$WORK/received/client2" "$WORK/received/client4" > "$WORK/server/config/client_paths.properties"
+printf 'client1=%s\nclient2=%s\nclient4=%s\nclient5=%s\n' "$KEY1" "$KEY2" "$KEY4" "$KEY5" > "$WORK/server/config/client_keys.properties"
+printf 'client1=%s\nclient2=%s\nclient4=%s\nclient5=%s\n' "$WORK/received/client1" "$WORK/received/client2" "$WORK/received/client4" "$WORK/received/client5" > "$WORK/server/config/client_paths.properties"
 write_server_config "$WORK/server-rename" "$RENAME_PORT" rename
 printf 'client3=%s\n' "$KEY3" > "$WORK/server-rename/config/client_keys.properties"
 printf 'client3=%s\n' "$WORK/received/client3" > "$WORK/server-rename/config/client_paths.properties"
@@ -231,9 +233,55 @@ check "second mask after ';' applies" wait_for 10 [ -f "$R4/report_01.txt" ]
 check "matching files deleted from source" wait_for 5 [ ! -e "$WORK/src4/data.csv" ]
 check "non-matching file not sent" [ ! -e "$R4/notes.txt" ]
 check "'?' matches exactly one character" [ ! -e "$R4/report_001.txt" ]
-check "non-matching files left in source" [ -f "$WORK/src4/notes.txt" ] && [ -f "$WORK/src4/report_001.txt" ]
+check "non-matching files left in source" test -f "$WORK/src4/notes.txt" -a -f "$WORK/src4/report_001.txt"
 check "client logs the configured mask" grep -q "File Mask: \*.csv; report_??.TXT" "$WORK/client4/logs/client_jfiltra.log"
 check "default mask sends everything (no filemask in client1 config)" grep -q "File Mask: \*$" "$CLIENT_LOG"
+
+echo "One-time run"
+check "loop is the default run mode" grep -q "Run Mode: loop" "$CLIENT_LOG"
+check "time is the default file order" grep -q "File Order: time" "$CLIENT_LOG"
+C5="$WORK/client5"
+write_client_config "$C5" client5 "$WORK/src5" "$KEY5" "$PORT"
+echo "run.mode=Once" >> "$C5/config/client.properties"
+run_once() {
+  # $1: file.order; prints the exit code
+  sed -i '/^file.order=/d' "$C5/config/client.properties"
+  [ -n "$1" ] && echo "file.order=$1" >> "$C5/config/client.properties"
+  (cd "$C5" && "$JAVA" -cp "lib/*" client.JFiltraClient config/client.properties > once.log 2>&1)
+  echo $?
+}
+# a: largest and newest, b: smallest, c: oldest
+make_outbox() {
+  rm -rf "$WORK/src5" && mkdir -p "$WORK/src5"
+  head -c 300 /dev/zero | tr '\0' a > "$WORK/src5/a.txt"; touch -d '2026-01-03 10:00' "$WORK/src5/a.txt"
+  head -c 100 /dev/zero | tr '\0' b > "$WORK/src5/b.txt"; touch -d '2026-01-02 10:00' "$WORK/src5/b.txt"
+  head -c 200 /dev/zero | tr '\0' c > "$WORK/src5/c.txt"; touch -d '2026-01-01 10:00' "$WORK/src5/c.txt"
+}
+# The one file sent: the only one missing from the outbox
+sent_file() { for f in a b c; do [ -e "$WORK/src5/$f.txt" ] || printf '%s' "$f"; done; }
+for case in ":c" "time:c" "!time:a" "size:b" "!size:a" "name:a" "!Name:c"; do
+  order="${case%%:*}"; want="${case##*:}"
+  make_outbox
+  code="$(run_once "$order")"
+  check "once, file.order=${order:-(default)}: exit 0 and only $want.txt sent" [ "$code:$(sent_file)" = "0:$want" ]
+done
+check "sent file delivered with the same content" cmp -s "$WORK/received/client5/a.txt" <(head -c 300 /dev/zero | tr '\0' a)
+rm -rf "$WORK/src5" && mkdir -p "$WORK/src5"
+code="$(run_once name)"
+check "once with an empty outbox exits with 2" [ "$code" = 2 ]
+make_outbox
+sed -i "s/^server.port=.*/server.port=$((PORT + 9))/" "$C5/config/client.properties"
+code="$(run_once name)"
+check "once with an unreachable server exits with 3" [ "$code" = 3 ]
+check "file kept after a failed one-time run" [ -f "$WORK/src5/a.txt" ]
+sed -i "s/^server.port=.*/server.port=$PORT/" "$C5/config/client.properties"
+code="$(run_once date)"
+check "invalid file.order exits with 1" [ "$code" = 1 ]
+check "invalid file.order message names the values" grep -q "file.order must be time, size or name" "$C5/once.log"
+sed -i 's/^run.mode=.*/run.mode=twice/' "$C5/config/client.properties"
+code="$(run_once name)"
+check "invalid run.mode exits with 1" [ "$code" = 1 ]
+check "invalid run.mode message names the values" grep -q "run.mode must be loop or once, but is: twice" "$C5/once.log"
 
 echo "Duplicates"
 echo "same content" > "$WORK/src1/same.txt"

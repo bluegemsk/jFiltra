@@ -88,6 +88,7 @@ client/
 test/
   smoke-test.sh           end-to-end test (see Testing)
   FileMaskTest.java       unit tests for the filemask matcher, run by smoke-test.sh
+  FileOrderTest.java      unit tests for file.order, run by smoke-test.sh
   NameConflictTest.java   unit tests for on.name.conflict, run by smoke-test.sh
   ParallelSendTest.java   parallel uploads of one name, run by smoke-test.sh
 ```
@@ -153,6 +154,8 @@ stored in `server/incoming/`. The storage directory is created if it doesn't exi
 | `polling.interval.seconds` | No       | How often to scan the directories (default `10`; shipped value: `3`) |
 | `socket.timeout.seconds`   | No       | Seconds to wait for the server's response before retrying later (default `120`) |
 | `stable.polls`             | No       | Number of scans a file must stay unchanged before it is sent (default `2`) |
+| `run.mode`                 | No       | `loop` (default): run continuously; `once`: send one file and exit. See [One-time run](#one-time-run) |
+| `file.order`               | No       | Order in which files are sent: `time` (default, oldest first), `size` (smallest first) or `name` (A to Z); a leading `!` reverses it, e.g. `!time`. See [File order](#file-order) |
 | `filemask`                 | No       | File name masks of the files to send, separated by `,` or `;` (default `*`: all files). See [File mask](#file-mask) |
 | `ignore.patterns`          | No       | Comma-separated file name patterns that are never sent (default `.*,*.part,*.tmp,*.crdownload,~$*`; empty sends everything) |
 
@@ -177,6 +180,57 @@ filemask=*.csv; report_??.txt
   matches `filemask`.
 - Files that don't match stay in the source directory untouched. The client
   logs them at debug level only.
+
+### File order
+
+`file.order` decides which file is sent first, in both run modes:
+
+| Value  | First file sent                  | With `!` (e.g. `!size`)  |
+|--------|----------------------------------|--------------------------|
+| `time` | oldest (by modification time); default | newest             |
+| `size` | smallest                         | largest                  |
+| `name` | A to Z                           | Z to A                   |
+
+- The value is not case-sensitive (`Time`, `!SIZE`).
+- Files that are equal by the chosen key (same time or size) are always sent in
+  name order A to Z, also with `!`, so the order is always the same.
+- Names are compared character by character by Unicode code: digits before
+  letters, upper case before lower case (`B.txt` before `a.txt`).
+- Files from all source directories are ordered together.
+- In `loop` mode this is the order within each scan.
+
+### One-time run
+
+With `run.mode=once` the client does not keep running. It scans the source
+directories once, applies `filemask` and `ignore.patterns`, orders the files by
+`file.order`, sends **only the first file**, and exits. Use it from cron, a
+scheduler or a script, for example to send the oldest waiting file every minute:
+
+```properties
+run.mode=once
+file.order=time
+```
+
+```bash
+client/script/start-client.sh; echo "exit code $?"
+```
+
+- Before sending, the client waits 1 second and skips files that changed in that
+  time (still being written); then the next file in order is sent.
+  `stable.polls` and `polling.interval.seconds` are not used in this mode.
+- There is one attempt and no retries. A file that was not sent stays in the
+  source directory and is tried again by the next run.
+- The value is not case-sensitive. An invalid `run.mode` or `file.order` stops
+  the client with exit code 1.
+
+Exit codes (in both modes, 1 also means a configuration error at startup):
+
+| Code | Meaning |
+|------|---------|
+| `0`  | The file was sent and deleted from the source directory |
+| `1`  | Configuration error (missing or invalid setting, missing config file) |
+| `2`  | Nothing to send: no matching file, or all files are still being written |
+| `3`  | Transfer failed: server not reachable, file rejected by the server, file not readable, or sent but not deletable |
 
 ### Keys
 
@@ -471,7 +525,8 @@ Protection that jFiltra does provide:
 
 `test/smoke-test.sh` builds server and client, runs them in a temporary
 directory, and checks the main behaviours: delivery, skipped files and symbolic
-links, the `filemask` setting, every `on.name.conflict` mode (including 20
+links, the `filemask` setting, the one-time run with every `file.order` value and its
+exit codes, every `on.name.conflict` mode (including 20
 parallel uploads of one name) (with unit tests of the matcher), oversized files, wrong keys, duplicates, retries, name conflicts, an
 unreachable server, startup errors, and that the JARs run on Java 8. It needs
 Java and the Log4j 2 JARs in `server/lib` and `client/lib`:
