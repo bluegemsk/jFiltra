@@ -44,6 +44,8 @@ public class FileMaskTest {
         match("ž*.TXT", "Žltý.txt", true);
         match("**a", "bba", true);
         match("?", "", false);
+        match("x?.txt", "x\uD83D\uDE00.txt", true);   // ? matches a whole emoji
+        match("x??.txt", "x\uD83D\uDE00.txt", false);
         // A pathological mask must not take exponential time
         char[] a = new char[5000];
         Arrays.fill(a, 'a');

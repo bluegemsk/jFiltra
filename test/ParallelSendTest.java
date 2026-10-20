@@ -4,6 +4,7 @@
  * This project is licensed under the PolyForm Noncommercial License 1.0.0.
  *
  * Usage: ParallelSendTest <port> <label> <key> <storageDir> <mode> <count>
+ *        ParallelSendTest <port> <label> <key> <storageDir> expect <announcedSize|0> <reply>
  * Prints one line and exits with 0 if the stored result is correct for the mode.
  */
 import java.io.*;
@@ -29,6 +30,10 @@ public class ParallelSendTest {
     }
 
     static String send(int port, String label, String key, byte[] data) throws Exception {
+        return send(port, label, key, data, null);
+    }
+
+    static String send(int port, String label, String key, byte[] data, Long announcedSize) throws Exception {
         byte[] k = MessageDigest.getInstance("SHA-256").digest(key.getBytes(StandardCharsets.UTF_8));
         Cipher cipher = Cipher.getInstance("AES");
         cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(k, "AES"));
@@ -46,8 +51,10 @@ public class ParallelSendTest {
             dos.writeUTF(label);
             dos.writeUTF(NAME);
             dos.writeUTF(hash.toString());
-            dos.writeLong(enc.size());
-            enc.writeTo(dos);
+            dos.writeLong(announcedSize != null ? announcedSize : enc.size());
+            if (announcedSize == null) {
+                enc.writeTo(dos);
+            }
             dos.flush();
             return new DataInputStream(s.getInputStream()).readUTF();
         }
@@ -59,6 +66,15 @@ public class ParallelSendTest {
         Path dir = Paths.get(args[3]);
         String mode = args[4];
         int count = Integer.parseInt(args[5]);
+
+        // Single uploads that must get a given reply: <mode> is "expect", args[6] the reply,
+        // count the announced size (0 = real size)
+        if (mode.equals("expect")) {
+            String reply = send(port, label, key, content(0), count == 0 ? null : (long) count);
+            if (!reply.equals(args[6])) fail("server replied " + reply + ", expected " + args[6]);
+            System.out.println("ParallelSendTest: got " + reply);
+            return;
+        }
 
         ExecutorService pool = Executors.newFixedThreadPool(count);
         final CountDownLatch go = new CountDownLatch(1);

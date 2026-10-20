@@ -71,7 +71,18 @@ export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64   # path depends on the dist
 
 The scripts stop with a clear message if Java is missing, older than Java 8, or
 (for compiling) only a JRE without `javac` is installed. On Windows they use
-`%JAVA_HOME%\bin` the same way.
+`%JAVA_HOME%\bin` the same way, but only check that Java can be started.
+
+### Locale
+
+On Linux and macOS, Java reads file names using the system locale. Without a
+UTF-8 locale (for example `POSIX`/`C`, which is common for systemd services and
+minimal containers), names like `č.txt` can't be read correctly. Server and
+client therefore refuse to start (exit code `1`) with the message
+`File names need a UTF-8 locale`. The `.sh` scripts select `C.UTF-8` or
+`en_US.UTF-8` themselves when the current locale isn't UTF-8 and one of them is
+installed. If you start Java directly, set e.g. `LANG=C.UTF-8` (on RHEL 7:
+`LANG=en_US.UTF-8`). Windows is not affected.
 
 ## Project layout
 
@@ -157,7 +168,7 @@ stored in `server/incoming/`. The storage directory is created if it doesn't exi
 | `run.mode`                 | No       | `loop` (default): run continuously; `once`: send one file and exit. See [One-time run](#one-time-run) |
 | `file.order`               | No       | Order in which files are sent: `time` (default, oldest first), `size` (smallest first) or `name` (A to Z); a leading `!` reverses it, e.g. `!time`. See [File order](#file-order) |
 | `filemask`                 | No       | File name masks of the files to send, separated by `,` or `;` (default `*`: all files). See [File mask](#file-mask) |
-| `ignore.patterns`          | No       | Comma-separated file name patterns that are never sent (default `.*,*.part,*.tmp,*.crdownload,~$*`; empty sends everything) |
+| `ignore.patterns`          | No       | Comma-separated file name patterns that are never sent, not case-sensitive (default `.*,*.part,*.tmp,*.crdownload,~$*`; empty sends everything) |
 
 ### File mask
 
@@ -220,6 +231,9 @@ client/script/start-client.sh; echo "exit code $?"
   `stable.polls` and `polling.interval.seconds` are not used in this mode.
 - There is one attempt and no retries. A file that was not sent stays in the
   source directory and is tried again by the next run.
+- A file the server rejects for good (`File too large`, `Invalid file name`) is
+  skipped, and the next file in order is sent in the same run, so one such file
+  can't block every run.
 - The value is not case-sensitive. An invalid `run.mode` or `file.order` stops
   the client with exit code 1.
 
@@ -229,7 +243,7 @@ Exit codes (in both modes, 1 also means a configuration error at startup):
 |------|---------|
 | `0`  | The file was sent and deleted from the source directory |
 | `1`  | Configuration error (missing or invalid setting, missing config file) |
-| `2`  | Nothing to send: no matching file, or all files are still being written |
+| `2`  | Nothing to send: no matching file, or every file is still being written or rejected for good |
 | `3`  | Transfer failed: server not reachable, file rejected by the server, file not readable, or sent but not deletable |
 
 ### Keys
@@ -311,6 +325,7 @@ After=network-online.target
 
 [Service]
 User=jfiltra
+Environment=LANG=C.UTF-8
 ExecStart=/opt/jfiltra/server/script/start-server.sh
 Restart=on-failure
 
@@ -318,6 +333,7 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
+On RHEL 7, use `Environment=LANG=en_US.UTF-8` (see [Locale](#locale)).
 Then run `sudo systemctl enable --now jfiltra-server`. The client works the same
 way with `start-client.sh`. Both exit with code `1` when they can't start, for
 example because the port is in use, so systemd reports the failure.
@@ -343,7 +359,7 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
   in `.part` or `.tmp` are ignored by default for exactly this purpose.
 - Only files matching `filemask` are sent (default: all files); the others stay
   in the source directory.
-- Files matching `ignore.patterns` are never sent. By default these are hidden
+- Files matching `ignore.patterns` are never sent (upper and lower case don't matter). By default these are hidden
   files (starting with `.`), files ending in `.part`, `.tmp` or `.crdownload`, and
   Office lock files (starting with `~$`).
 - If a file changes while it is being sent, the client keeps it instead of
@@ -367,7 +383,9 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
   - contain control characters;
   - are longer than 255 bytes;
   - are reserved on Windows (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, also with an extension, such as `con.txt`);
-  - end with a dot or a space.
+  - end with a dot or a space;
+  - are not valid on the server's file system (for example `:` `*` `?` `"` `<` `>` `|` on a Windows server).
+- Storage paths in `client_paths.properties` are trimmed: spaces around a value are ignored.
 - The server first writes each file under a hidden temporary name
   (`.jfiltra-<random>.part`) in the storage directory, then publishes it under
   its real name in one atomic step. Other programs watching the storage directory
@@ -385,13 +403,21 @@ The client never gives up on a file, but it waits longer between attempts when
 retrying doesn't help right away, so a large file isn't sent again in full on
 every poll:
 
-- **Server unreachable** (server down, connection refused or lost, server busy):
+- **Server unreachable** (server down, connection refused, server busy):
   the client pauses all transfers. The pause starts at the polling interval and
   doubles after each failed attempt, up to 1 minute. Each attempt is logged in
   one line.
+- **Connection lost while sending** (the server was reached): only this file is
+  retried, after the polling interval, then after twice as long each time, up to
+  10 minutes, so it can't hold up the other files. A file that is too large is
+  rejected by the server before it reads the data; the client reads that reply
+  even when the server closed the connection during the send.
+- **Delivered, but the client can't delete it** (no permission): the file is
+  **not sent again**. Only the delete is retried, with the same growing delays,
+  so the server never gets it twice (this matters for `append` and `rename`).
+  After a client restart the file is sent once more.
 - **Rejected for a reason a person can fix** (`File already exists`, `Decryption
-  failed`, `No encryption key found`, a failed hash check), or delivered but the
-  client can't delete it (no permission): the file is retried after the polling
+  failed`, `No encryption key found`, a failed hash check): the file is retried after the polling
   interval, then after twice as long each time, up to 10 minutes. Fixing the
   problem, for example the key on the server, needs no restart; the file is sent
   at its next attempt. If the file itself changes, it is sent again right away.
@@ -407,7 +433,8 @@ stops the server at startup with an error.
 
 - `rename` (default): the new file is stored under the name with the lowest free
   number added before the last extension: `report.csv` becomes `report_1.csv`,
-  then `report_2.csv`, and so on. `archive.tar.gz` becomes `archive.tar_1.gz`,
+  then `report_2.csv`, and so on. Very long names are shortened before the number,
+  so the new name stays within 255 bytes. `archive.tar.gz` becomes `archive.tar_1.gz`,
   and a name without an extension such as `README` becomes `README_1`. The client
   deletes its copy. This suits files that arrive under the same name again and
   again, such as a daily `export.csv`. Parallel transfers of one name always get
@@ -421,7 +448,9 @@ stops the server at startup with an error.
   stored as a new file if there is none). Data is appended only after the whole
   file was received and verified, and appends to the same name are done one at a
   time, so parallel transfers never mix their data. If appending fails (for
-  example the disk is full), the partly appended data is removed. Note: if the
+  example the disk is full), the partly appended data is removed. A directory with
+  the file's name gives `File already exists` (also with `overwrite`); the client
+  retries later. Note: if the
   client misses the server's reply, it sends the file again and the content is
   appended twice.
 - `reject`: the stored file is kept, and the new file stays on the client. The

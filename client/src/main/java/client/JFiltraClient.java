@@ -41,7 +41,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraClient {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.0.3";
+    private static final String VERSION = "1.0.4";
     
     // Initialize logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraClient.class);
@@ -65,6 +65,14 @@ public class JFiltraClient {
     private String fileOrder;                   // file.order: time, size or name, ! reverses
     private Comparator<Candidate> fileComparator; // Order in which files are sent
     private boolean lastFileSent;               // Whether the last processFile call succeeded
+    private boolean lastPermanentRejection;     // Whether the server last rejected a file for good
+
+    // Files delivered whose deletion failed, with their snapshot: only the delete is retried,
+    // never the transfer (a resend would append or store the file again)
+    private final Map<Path, String> deliveredFiles = new HashMap<>();
+
+    // Source directories that could not be read, so the error is logged only once
+    private final Set<String> failingDirs = new HashSet<>();
 
     // Exit codes of run.mode=once (1 is also used for configuration errors in both modes)
     static final int EXIT_SENT = 0;
@@ -102,6 +110,10 @@ public class JFiltraClient {
     
     // Returned by sendFileToServer when the file changed between the two passes
     private static final String CHANGED_DURING_SEND = "(file changed while being sent)";
+
+    // sendFileToServer result when the connection broke while sending and no reply came:
+    // retried for this file only, so one problem file can't block the others
+    private static final String BROKEN_DURING_SEND = "(connection lost while sending)";
     
     // Files the server rejected for a reason that may be fixed later (e.g. a wrong key or
     // a name conflict), with when to try again. Retrying waits longer after each rejection,
@@ -151,6 +163,9 @@ public class JFiltraClient {
      */
     public JFiltraClient(String configPath) {
         try {
+            // File names are decoded with the system locale; without UTF-8, non-ASCII names break
+            checkUtf8FileNames();
+            
             // Load configuration
             config = loadProperties(configPath);
             
@@ -190,7 +205,8 @@ public class JFiltraClient {
             ignoreMatchers = new ArrayList<>();
             for (String pattern : ignorePatterns.split(",")) {
                 if (!pattern.trim().isEmpty()) {
-                    ignoreMatchers.add(FileSystems.getDefault().getPathMatcher("glob:" + pattern.trim()));
+                    // Lower case on both sides: not case-sensitive on any system, like filemask
+                    ignoreMatchers.add(FileSystems.getDefault().getPathMatcher("glob:" + pattern.trim().toLowerCase(Locale.ROOT)));
                 }
             }
 
@@ -367,9 +383,14 @@ public class JFiltraClient {
                     // Symbolic links are skipped: following them would send (and then delete the
                     // link to) any file the client can read, such as files outside the source directory.
                     candidates.addAll(listCandidates(dir));
+                    if (failingDirs.remove(dirPath)) {
+                        logger.info("Directory is readable again: " + dirPath);
+                    }
                 } catch (Exception e) {
-                    logger.error("Error polling directory " + dirPath + ": " + e.getMessage(), e);
-                   
+                    // Log once, not on every poll
+                    if (failingDirs.add(dirPath)) {
+                        logger.error("Cannot read directory " + dirPath + ": " + e + " (checked again on every poll)");
+                    }
                 }
             }
             
@@ -384,8 +405,27 @@ public class JFiltraClient {
             // Forget rejected files that are gone
             rejectedFiles.keySet().retainAll(currentStates.keySet());
             retries.keySet().retainAll(currentStates.keySet());
+            deliveredFiles.keySet().retainAll(currentStates.keySet());
         } catch (Throwable t) {
             logger.error("Unexpected error while polling directories: " + t, t);
+        }
+    }
+
+    /**
+     * Refuses to run when Java decodes file names with a non-UTF-8 charset (e.g. the
+     * POSIX/C locale): non-ASCII names would be sent mangled and the source deleted.
+     * Windows uses UTF-16 file names and is not affected.
+     *
+     * @throws IllegalArgumentException If the file name encoding is not UTF-8
+     */
+    static void checkUtf8FileNames() {
+        if (System.getProperty("os.name", "").startsWith("Windows")) {
+            return;
+        }
+        String enc = System.getProperty("sun.jnu.encoding", "");
+        if (!enc.equalsIgnoreCase("UTF-8") && !enc.equalsIgnoreCase("UTF8")) {
+            throw new IllegalArgumentException("File names need a UTF-8 locale, but the system uses " + enc
+                    + ". Set e.g. LANG=C.UTF-8 or LANG=en_US.UTF-8 (see README, Java)");
         }
     }
 
@@ -512,10 +552,15 @@ public class JFiltraClient {
                 }
                 logger.info("Sending one file (file.order=" + fileOrder + "): " + candidate.name);
                 lastFileSent = false;
+                lastPermanentRejection = false;
                 processFile(candidate.path, snapshot);
+                if (lastPermanentRejection) {
+                    // Would be rejected on every run: try the next file instead
+                    continue;
+                }
                 return lastFileSent ? EXIT_SENT : EXIT_TRANSFER_FAILED;
             }
-            logger.info("No file to send (all files are still being written)");
+            logger.info("No file to send (no file can be sent now: still being written or always rejected)");
             return EXIT_NOTHING_TO_SEND;
         } catch (Exception e) {
             logger.error("Error in one-time run: " + e, e);
@@ -580,13 +625,16 @@ public class JFiltraClient {
      * @param name The file name
      * @return true if the name matches the mask
      */
-    static boolean globMatches(String mask, String name) {
+    static boolean globMatches(String maskText, String nameText) {
+        // Work on whole characters (code points), so ? also matches e.g. an emoji
+        int[] mask = maskText.codePoints().toArray();
+        int[] name = nameText.codePoints().toArray();
         int m = 0, n = 0, starM = -1, starN = 0;
-        while (n < name.length()) {
-            if (m < mask.length() && mask.charAt(m) == '*') {
+        while (n < name.length) {
+            if (m < mask.length && mask[m] == '*') {
                 starM = m++;
                 starN = n;
-            } else if (m < mask.length() && (mask.charAt(m) == '?' || sameIgnoreCase(mask.charAt(m), name.charAt(n)))) {
+            } else if (m < mask.length && (mask[m] == '?' || sameIgnoreCase(mask[m], name[n]))) {
                 m++;
                 n++;
             } else if (starM >= 0) {
@@ -596,13 +644,13 @@ public class JFiltraClient {
                 return false;
             }
         }
-        while (m < mask.length() && mask.charAt(m) == '*') {
+        while (m < mask.length && mask[m] == '*') {
             m++;
         }
-        return m == mask.length();
+        return m == mask.length;
     }
 
-    private static boolean sameIgnoreCase(char a, char b) {
+    private static boolean sameIgnoreCase(int a, int b) {
         return a == b || Character.toLowerCase(a) == Character.toLowerCase(b)
                 || Character.toUpperCase(a) == Character.toUpperCase(b);
     }
@@ -614,7 +662,7 @@ public class JFiltraClient {
      * @return true if the file must not be sent
      */
     private boolean isIgnored(Path file) {
-        Path fileName = file.getFileName();
+        Path fileName = Paths.get(file.getFileName().toString().toLowerCase(Locale.ROOT));
         for (PathMatcher matcher : ignoreMatchers) {
             if (matcher.matches(fileName)) {
                 return true;
@@ -655,6 +703,17 @@ public class JFiltraClient {
                 if (!retry.snapshot.equals(snapshot)) {
                     retries.remove(file);
                 } else if (System.currentTimeMillis() < retry.nextAttemptMillis) {
+                    return;
+                }
+            }
+            
+            // Delivered before but not deleted: only retry the delete, never send it again
+            String delivered = deliveredFiles.get(file);
+            if (delivered != null) {
+                if (!delivered.equals(snapshot)) {
+                    deliveredFiles.remove(file); // Changed since: the new content is sent
+                } else {
+                    deleteDelivered(file, snapshot);
                     return;
                 }
             }
@@ -712,8 +771,13 @@ public class JFiltraClient {
                 return;
             }
             if (response == null) {
-                // No reply: the server is unreachable or the connection was lost
+                // No reply: the server is unreachable
                 scheduleServerRetry();
+                return;
+            }
+            if (BROKEN_DURING_SEND.equals(response)) {
+                // The server was reached but the connection broke: retry this file only
+                scheduleRetry(filePath, snapshot, fileName);
                 return;
             }
             
@@ -732,16 +796,10 @@ public class JFiltraClient {
                     logger.warn("File changed while being sent and was not deleted: " + fileName);
                     return;
                 }
-                try {
-                    Files.delete(filePath);
-                    retries.remove(filePath);
-                    lastFileSent = true;
-                } catch (IOException e) {
-                    // Delivered, but it would be sent again on every poll: retry with growing delays
-                    logger.error("File " + fileName + " was delivered but can't be deleted: " + e);
-                    scheduleRetry(filePath, snapshot, fileName);
-                }
+                retries.remove(filePath);
+                lastFileSent = deleteDelivered(filePath, snapshot);
             } else if (PERMANENT_REJECTIONS.contains(response)) {
+                lastPermanentRejection = true;
                 // Don't resend a file the server will always reject; it is tried again once it changes
                 rejectedFiles.put(filePath, snapshot);
                 logger.error("File " + fileName + " will not be sent again until it changes");
@@ -757,6 +815,34 @@ public class JFiltraClient {
             // OutOfMemoryError is caught too, so one file cannot stop the others from being processed
             logger.error("Error processing file " + fileName + ": " + e, e);
            
+        }
+    }
+
+    /**
+     * Deletes a file the server has stored. If that fails, the file is remembered as
+     * delivered, so only the delete is retried later (with growing delays), never the transfer.
+     *
+     * @param filePath The delivered file
+     * @param snapshot The file's size and modification time when it was sent
+     * @return true if the file was deleted
+     */
+    private boolean deleteDelivered(Path filePath, String snapshot) {
+        String fileName = filePath.getFileName().toString();
+        try {
+            Files.delete(filePath);
+            if (deliveredFiles.remove(filePath) != null) {
+                logger.info("Deleted delivered file: " + fileName);
+            }
+            retries.remove(filePath);
+            return true;
+        } catch (NoSuchFileException e) {
+            deliveredFiles.remove(filePath);
+            return true;
+        } catch (IOException e) {
+            logger.error("File " + fileName + " was delivered but can't be deleted (it is not sent again): " + e);
+            deliveredFiles.put(filePath, snapshot);
+            scheduleRetry(filePath, snapshot, fileName);
+            return false;
         }
     }
 
@@ -854,22 +940,41 @@ public class JFiltraClient {
             socket.setSoTimeout(socketTimeoutSeconds * 1000);
             DataOutputStream dos = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 65536));
             
-            // Send client label
-            dos.writeUTF(clientLabel);
+            CountingOutputStream sentCounter;
+            try {
+                // Send client label
+                dos.writeUTF(clientLabel);
             
-            // Send original file name
-            dos.writeUTF(originalFileName);
+                // Send original file name
+                dos.writeUTF(originalFileName);
             
-            // Send file hash
-            dos.writeUTF(fileHash);
+                // Send file hash
+                dos.writeUTF(fileHash);
             
-            // Send file size
-            dos.writeLong(encryptedSize);
+                // Send file size
+                dos.writeLong(encryptedSize);
             
-            // Send file data, compressed and encrypted on the fly
-            CountingOutputStream sentCounter = new CountingOutputStream(dos);
-            writeEncrypted(filePath, sentCounter, null);
-            dos.flush();
+                // Send file data, compressed and encrypted on the fly
+                sentCounter = new CountingOutputStream(dos);
+                writeEncrypted(filePath, sentCounter, null);
+                dos.flush();
+            
+            } catch (IOException writeError) {
+                // The connection broke while sending. The server may have rejected the file
+                // early (e.g. too large) and closed the connection: read its reply if it came.
+                try {
+                    socket.setSoTimeout(2000);
+                    String reply = new DataInputStream(socket.getInputStream()).readUTF();
+                    if (reply.startsWith("ERROR: ")) {
+                        logger.error("Server rejected file " + originalFileName + ": " + reply);
+                        return reply;
+                    }
+                } catch (IOException noReply) {
+                    // No reply available
+                }
+                logger.warn("Could not send " + originalFileName + ": connection lost while sending (" + writeError + ")");
+                return BROKEN_DURING_SEND;
+            }
             
             // The file changed between the two passes, so the server can't accept it.
             // Dropping the connection makes the server discard it; it is retried on the next poll.
@@ -944,7 +1049,7 @@ public class JFiltraClient {
             logger.info("Client is running on IP: " + clientIP);
 
         } catch (IOException e) {
-            logger.error("Error starting client: " + e.getMessage(), e);
+            logger.warn("Could not determine local IP address: " + e.getMessage());
             }
         
     }

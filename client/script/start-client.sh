@@ -15,6 +15,17 @@ if [ -z "$JAVA" ] || [ ! -x "$JAVA" ]; then
 fi
 
 # Check the version: jFiltra needs Java 8 or newer ("1.8.0_x" is Java 8, "11.0.x" is Java 11)
+# jFiltra needs a UTF-8 locale for non-ASCII file names. If the current one isn't
+# UTF-8 (e.g. POSIX/C, common under systemd), use C.UTF-8 or en_US.UTF-8 if installed.
+if [ "$(locale charmap 2>/dev/null)" != "UTF-8" ]; then
+  for loc in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
+    if locale -a 2>/dev/null | grep -qx "$loc"; then
+      export LC_ALL="$loc"
+      break
+    fi
+  done
+fi
+
 JAVA_VERSION="$("$JAVA" -version 2>&1 | awk -F '"' '/version/ {print $2; exit}')"
 JAVA_MAJOR="${JAVA_VERSION%%.*}"
 [ "$JAVA_MAJOR" = "1" ] && JAVA_MAJOR="$(echo "$JAVA_VERSION" | cut -d. -f2)"

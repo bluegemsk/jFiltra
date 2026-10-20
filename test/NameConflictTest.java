@@ -40,6 +40,22 @@ public class NameConflictTest {
         eq(JFiltraServer.numberedName("README", 3), "README_3");
         eq(JFiltraServer.numberedName(".profile", 1), ".profile_1");
         eq(JFiltraServer.numberedName("name.", 1), "name_1.");
+        // Very long names are shortened (whole characters) so the result fits in 255 bytes
+        StringBuilder longName = new StringBuilder();
+        for (int i = 0; i < 251; i++) longName.append('x');
+        String n255 = longName + ".csv";
+        String r = JFiltraServer.numberedName(n255, 12);
+        if (r.getBytes(java.nio.charset.StandardCharsets.UTF_8).length != 255 || !r.endsWith("_12.csv")) {
+            System.out.println("  FAIL  long name: " + r.length());
+            failed++;
+        }
+        StringBuilder wide = new StringBuilder();
+        for (int i = 0; i < 127; i++) wide.append('\u010d');   // 254 bytes
+        r = JFiltraServer.numberedName(wide.toString(), 3);
+        if (r.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 255 || !r.endsWith("\u010d_3")) {
+            System.out.println("  FAIL  long multi-byte name: " + r);
+            failed++;
+        }
         System.out.println(failed == 0 ? "NameConflictTest: all passed" : "NameConflictTest: " + failed + " failed");
         System.exit(failed == 0 ? 0 : 1);
     }

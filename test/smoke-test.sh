@@ -25,6 +25,7 @@ PASSED=0
 FAILED=0
 
 cleanup() {
+  chmod -R u+rwx "$WORK" 2>/dev/null
   for pid in "${PIDS[@]:-}"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null
   done
@@ -63,6 +64,16 @@ count() {
 random_key() {
   head -c 32 /dev/urandom | base64 | tr -d '\n'
 }
+
+# Server and client need a UTF-8 locale (same selection as the start scripts)
+if [ "$(locale charmap 2>/dev/null)" != "UTF-8" ]; then
+  for loc in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
+    if locale -a 2>/dev/null | grep -qx "$loc"; then
+      export LC_ALL="$loc"
+      break
+    fi
+  done
+fi
 
 echo "Building..."
 "$ROOT/server/script/compile.sh" >/dev/null || { echo "Server build failed"; exit 1; }
@@ -125,7 +136,7 @@ EOF
 }
 write_server_config "$WORK/server" "$PORT" reject
 printf 'client1=%s\nclient2=%s\nclient4=%s\nclient5=%s\n' "$KEY1" "$KEY2" "$KEY4" "$KEY5" > "$WORK/server/config/client_keys.properties"
-printf 'client1=%s\nclient2=%s\nclient4=%s\nclient5=%s\n' "$WORK/received/client1" "$WORK/received/client2" "$WORK/received/client4" "$WORK/received/client5" > "$WORK/server/config/client_paths.properties"
+printf 'client1=%s\nclient2=%s\nclient4=%s\nclient5=%s\n' "$WORK/received/client1" "$WORK/received/client2" "$WORK/received/client4" "$WORK/received/client5 " > "$WORK/server/config/client_paths.properties"
 write_server_config "$WORK/server-rename" "$RENAME_PORT" rename
 printf 'client3=%s\n' "$KEY3" > "$WORK/server-rename/config/client_keys.properties"
 printf 'client3=%s\n' "$WORK/received/client3" > "$WORK/server-rename/config/client_paths.properties"
@@ -141,7 +152,8 @@ polling.interval.seconds=1
 stable.polls=1
 EOF
 }
-write_client_config "$WORK/client" client1 "$WORK/src1" "$KEY1" "$PORT"
+write_client_config "$WORK/client" client1 "$WORK/src1,$WORK/locked" "$KEY1" "$PORT"
+mkdir -p "$WORK/locked" && chmod 000 "$WORK/locked"
 write_client_config "$WORK/client2" client2 "$WORK/src2" "$WRONG_KEY" "$PORT"
 write_client_config "$WORK/client3" client3 "$WORK/src3" "$KEY3" "$RENAME_PORT"
 write_client_config "$WORK/client4" client4 "$WORK/src4" "$KEY4" "$PORT"
@@ -161,6 +173,11 @@ CLIENT2_LOG="$WORK/client2/logs/client_jfiltra.log"
 R1="$WORK/received/client1"
 
 echo "Startup checks"
+(cd "$WORK/client" && env LC_ALL=C LANG=C "$JAVA" -cp "lib/*" client.JFiltraClient config/client.properties > locale.log 2>&1)
+check "client refuses to start without a UTF-8 locale" [ "$?" -eq 1 ]
+check "locale error message names the fix" grep -q "File names need a UTF-8 locale" "$WORK/client/locale.log"
+(cd "$WORK/server" && env LC_ALL=C LANG=C "$JAVA" -cp "lib/*" server.JFiltraServer config/server.properties > locale.log 2>&1)
+check "server refuses to start without a UTF-8 locale" [ "$?" -eq 1 ]
 cp -R "$WORK/server" "$WORK/server-weak"
 printf 'client1=CHANGE_ME_client1_secret_key_000\n' > "$WORK/server-weak/config/client_keys.properties"
 (cd "$WORK/server-weak" && "$JAVA" -cp "lib/*" server.JFiltraServer config/server.properties > console.log 2>&1)
@@ -189,6 +206,9 @@ echo "hello jFiltra" > "$WORK/src1/normal.txt"
 echo "secret outside the source directory" > "$WORK/secret.txt"
 ln -s "$WORK/secret.txt" "$WORK/src1/link.txt"
 echo "draft" > "$WORK/src1/draft.tmp"
+echo "draft" > "$WORK/src1/DRAFT.TMP"
+# Older than everything else, so it is first in file.order=time: must not block other files
+head -c 41943040 /dev/urandom > "$WORK/src1/huge.bin" && touch -d '2026-01-01 00:00' "$WORK/src1/huge.bin"
 echo "hidden" > "$WORK/src1/.hidden"
 head -c 2097152 /dev/urandom > "$WORK/src1/big.bin"
 echo "sent with the wrong key" > "$WORK/src2/wrongkey.txt"
@@ -216,6 +236,11 @@ sleep 5
 check "symbolic link not sent" [ ! -e "$R1/link.txt" ]
 check "symbolic link left in place" [ -L "$WORK/src1/link.txt" ]
 check "*.tmp file not sent" [ ! -e "$R1/draft.tmp" ]
+check "ignore.patterns not case-sensitive (DRAFT.TMP not sent)" [ -f "$WORK/src1/DRAFT.TMP" ]
+check "huge file rejected without blocking other files" test ! -e "$R1/huge.bin" -a -f "$WORK/src1/huge.bin"
+check "huge file did not pause transfers as 'server unreachable'" [ "$(count 'Will try the server again' "$CLIENT_LOG")" -eq 0 ]
+check "huge file rejected right away" wait_for 15 grep -q "huge.bin from client client1: size 4" "$SERVER_LOG"
+check "unreadable source directory logged once" [ "$(count 'Cannot read directory' "$CLIENT_LOG")" -eq 1 ]
 check "hidden file not sent" [ ! -e "$R1/.hidden" ]
 check "oversized file not stored" [ ! -e "$R1/big.bin" ]
 check "oversized file kept in source" [ -f "$WORK/src1/big.bin" ]
@@ -265,6 +290,11 @@ for case in ":c" "time:c" "!time:a" "size:b" "!size:a" "name:a" "!Name:c"; do
   code="$(run_once "$order")"
   check "once, file.order=${order:-(default)}: exit 0 and only $want.txt sent" [ "$code:$(sent_file)" = "0:$want" ]
 done
+check "storage path with trailing space is trimmed" [ ! -e "$WORK/received/client5 " ]
+make_outbox
+head -c 2097152 /dev/zero > "$WORK/src5/z.bin"
+code="$(run_once '!size')"
+check "once: permanently rejected first file skipped, next file sent" [ "$code:$(sent_file)" = "0:a" ]
 check "sent file delivered with the same content" cmp -s "$WORK/received/client5/a.txt" <(head -c 300 /dev/zero | tr '\0' a)
 rm -rf "$WORK/src5" && mkdir -p "$WORK/src5"
 code="$(run_once name)"
@@ -343,6 +373,35 @@ for mode in "" OVERWRITE Append; do
   wait "${PIDS[$last]}" 2>/dev/null
   PIDS[$last]=""
 done
+rm -rf "$WORK/received/parallel" && mkdir -p "$WORK/received/parallel/parallel.csv"
+write_server_config "$WORK/server-mode" "$MODE_PORT" overwrite
+rm -rf "$WORK/server-mode/logs"
+start "$WORK/server-mode" server.JFiltraServer server.properties jfiltra-server.jar
+wait_for 15 grep -q "Server is running" "$MODE_LOG" 2>/dev/null
+check "overwrite onto a directory: 'File already exists' (retried later)" "$JAVA" -cp "$WORK/unit" ParallelSendTest "$MODE_PORT" parallel "$KEYP" x expect 0 "ERROR: File already exists"
+check "directory name reported clearly" grep -q "a directory or other non-file has this name" "$MODE_LOG"
+check "negative size rejected" "$JAVA" -cp "$WORK/unit" ParallelSendTest "$MODE_PORT" parallel "$KEYP" x expect -5 "ERROR: File too large"
+check "negative size logged as invalid" grep -q "invalid size -5" "$MODE_LOG"
+
+echo "Append with a source file that can't be deleted"
+rm -rf "$WORK/received/parallel" && mkdir -p "$WORK/received/parallel" "$WORK/src6"
+printf 'parallel=%s\n' "$WORK/received/parallel" > "$WORK/server-mode/config/client_paths.properties"
+kill "${PIDS[$((${#PIDS[@]} - 1))]}" 2>/dev/null; wait "${PIDS[$((${#PIDS[@]} - 1))]}" 2>/dev/null
+rm -rf "$WORK/server-mode/logs"
+write_server_config "$WORK/server-mode" "$MODE_PORT" append
+start "$WORK/server-mode" server.JFiltraServer server.properties jfiltra-server.jar
+wait_for 15 grep -q "Server is running" "$MODE_LOG" 2>/dev/null
+mkdir -p "$WORK/client6" && cp -R "$ROOT/client/lib" "$ROOT/client/config" "$WORK/client6/"
+write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+echo "line" > "$WORK/src6/log.txt" && chmod 555 "$WORK/src6"
+start "$WORK/client6" client.JFiltraClient client.properties jfiltra-client.jar
+wait_for 15 [ -f "$WORK/received/parallel/log.txt" ]
+sleep 8
+check "undeletable file appended only once" cmp -s "$WORK/received/parallel/log.txt" <(echo "line")
+check "undeletable file reported as not sent again" grep -q "can't be deleted (it is not sent again)" "$WORK/client6/logs/client_jfiltra.log"
+chmod 755 "$WORK/src6"
+check "file deleted once the directory is writable" wait_for 20 [ ! -e "$WORK/src6/log.txt" ]
+check "still appended only once" cmp -s "$WORK/received/parallel/log.txt" <(echo "line")
 
 echo "Server down"
 kill "${PIDS[0]}" 2>/dev/null

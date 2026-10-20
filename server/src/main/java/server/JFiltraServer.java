@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
@@ -67,7 +68,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraServer {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.0.3";
+    private static final String VERSION = "1.0.4";
     
     // Logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraServer.class);
@@ -134,6 +135,9 @@ public class JFiltraServer {
      */
     public JFiltraServer(String configPath) {
         try {
+            // File names are decoded with the system locale; without UTF-8, non-ASCII names break
+            checkUtf8FileNames();
+            
             // Load main configuration file
             config = loadProperties(configPath);
             
@@ -575,11 +579,17 @@ public class JFiltraServer {
             
             // Reject invalid or oversized transfers before receiving any data
             if (fileSize < 0 || fileSize > maxFileSizeBytes) {
-                logger.error("Rejected file " + logName + " from client " + logLabel
-                        + ": size " + fileSize + " bytes exceeds limit of " + maxFileSizeBytes + " bytes");
-                // Discard the upload, so the client can read the response
-                new LimitedInputStream(dis, fileSize).skipRemaining();
+                if (fileSize < 0) {
+                    logger.error("Rejected file " + logName + " from client " + logLabel + ": invalid size " + fileSize);
+                } else {
+                    logger.error("Rejected file " + logName + " from client " + logLabel
+                            + ": size " + fileSize + " bytes exceeds limit of " + maxFileSizeBytes + " bytes");
+                }
+                // Reply right away without reading the data: reading a huge upload could take
+                // longer than the transfer time limit. The client reads this reply when its send fails.
                 dos.writeUTF("ERROR: File too large");
+                dos.flush();
+                clientSocket.shutdownOutput();
                 return;
             }
             
@@ -596,7 +606,10 @@ public class JFiltraServer {
             
             // Determine storage location for this client
             String clientStoragePath = clientPaths.getProperty(clientLabel);
-            if (clientStoragePath == null) {
+            if (clientStoragePath != null) {
+                clientStoragePath = clientStoragePath.trim(); // as in cleanUpPartFiles
+            }
+            if (clientStoragePath == null || clientStoragePath.isEmpty()) {
                 clientStoragePath = "incoming"; // Default storage directory
             }
             
@@ -616,6 +629,18 @@ public class JFiltraServer {
                 logger.error("Rejected invalid file name: " + logName + " from client: " + logLabel);
                 new LimitedInputStream(dis, fileSize).skipRemaining();
                 dos.writeUTF("ERROR: Invalid file name");
+                return;
+            }
+
+            // Overwrite and append need a regular file (or no file) under this name; a directory
+            // or other special file is a problem someone must fix, so the client retries later
+            if ((onNameConflict.equals("overwrite") || onNameConflict.equals("append"))
+                    && Files.exists(destinationFile.toPath(), LinkOption.NOFOLLOW_LINKS)
+                    && !Files.isRegularFile(destinationFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                logger.error("Cannot store " + logName + " from client " + logLabel
+                        + ": a directory or other non-file has this name: " + destinationFile);
+                new LimitedInputStream(dis, fileSize).skipRemaining();
+                dos.writeUTF("ERROR: File already exists");
                 return;
             }
 
@@ -849,6 +874,24 @@ public class JFiltraServer {
     }
 
     /**
+     * Refuses to run when Java decodes file names with a non-UTF-8 charset (e.g. the
+     * POSIX/C locale): non-ASCII names would be stored mangled or not at all. Windows
+     * uses UTF-16 file names and is not affected.
+     *
+     * @throws IllegalArgumentException If the file name encoding is not UTF-8
+     */
+    static void checkUtf8FileNames() {
+        if (System.getProperty("os.name", "").startsWith("Windows")) {
+            return;
+        }
+        String enc = System.getProperty("sun.jnu.encoding", "");
+        if (!enc.equalsIgnoreCase("UTF-8") && !enc.equalsIgnoreCase("UTF8")) {
+            throw new IllegalArgumentException("File names need a UTF-8 locale, but the system uses " + enc
+                    + ". Set e.g. LANG=C.UTF-8 or LANG=en_US.UTF-8 (see README, Java)");
+        }
+    }
+
+    /**
      * Parses on.name.conflict: reject, rename, overwrite or append, ignoring case.
      * Missing or empty means rename.
      *
@@ -879,10 +922,22 @@ public class JFiltraServer {
      */
     static String numberedName(String fileName, int n) {
         int dot = fileName.lastIndexOf('.');
-        if (dot <= 0) {
-            return fileName + "_" + n;
+        String base = (dot <= 0) ? fileName : fileName.substring(0, dot);
+        String ext = (dot <= 0) ? "" : fileName.substring(dot);
+        String suffix = "_" + n;
+        // Very long names: shorten the base (whole characters) so the result fits in 255 bytes
+        if (utf8Length(suffix + ext) > MAX_FILE_NAME_BYTES - 1) {
+            ext = "";
         }
-        return fileName.substring(0, dot) + "_" + n + fileName.substring(dot);
+        int room = MAX_FILE_NAME_BYTES - utf8Length(suffix + ext);
+        while (utf8Length(base) > room) {
+            base = base.substring(0, base.offsetByCodePoints(0, base.codePointCount(0, base.length()) - 1));
+        }
+        return base + suffix + ext;
+    }
+
+    private static int utf8Length(String text) {
+        return text.getBytes(StandardCharsets.UTF_8).length;
     }
 
     /**
@@ -1075,7 +1130,12 @@ public class JFiltraServer {
 
         // Double-check the resolved path is directly inside the storage directory
         Path baseDir = storageDir.toPath().toAbsolutePath().normalize();
-        Path target = baseDir.resolve(fileName).normalize();
+        Path target;
+        try {
+            target = baseDir.resolve(fileName).normalize();
+        } catch (InvalidPathException e) {
+            return null; // Not valid on this file system (e.g. : * ? on Windows)
+        }
         if (!baseDir.equals(target.getParent())) {
             return null;
         }
