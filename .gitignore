@@ -17,3 +17,6 @@
 
 # Local working files (not part of the project)
 /work/
+
+# DB client spool directory
+dbclient/spool/

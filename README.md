@@ -10,6 +10,9 @@ directories to a central server, reliably and with as little setup as possible.
 - The **server** accepts connections from multiple clients. It looks up the
   client's key, decrypts and decompresses the file, checks the SHA-256 hash, and
   stores the file in that client's configured storage directory.
+- The **DB client** (since 1.1.0) sends the result of an SQL query instead of
+  files: it writes the rows to a CSV, TSV or JSON Lines file, sends it like the
+  client, and then runs your post-transfer SQL. See [DB client](#db-client).
 
 jFiltra does not encrypt the connection. Use it on a trusted network, or through
 a VPN or SSH tunnel; see [Security notes](#security-notes).
@@ -96,12 +99,20 @@ client/
   config/                 client.properties, log4j2.properties
   script/                 compile.sh/.bat, start-client.sh/.bat
   src/main/java/client/   JFiltraClient.java
+dbclient/                 DB client, see dbclient/README.md
+  config/                 dbclient.properties, log4j2.properties
+  lib/                    put Log4j and your JDBC driver JARs here
+  script/                 compile.sh/.bat, start-dbclient.sh/.bat
+  src/main/java/dbclient/ JFiltraDbClient.java
 test/
   smoke-test.sh           end-to-end test (see Testing)
   FileMaskTest.java       unit tests for the filemask matcher, run by smoke-test.sh
   FileOrderTest.java      unit tests for file.order, run by smoke-test.sh
   NameConflictTest.java   unit tests for on.name.conflict, run by smoke-test.sh
   ParallelSendTest.java   parallel uploads of one name, run by smoke-test.sh
+  dbclient-smoke-test.sh  end-to-end test of the DB client against a real database
+  DbFormatTest.java       unit tests for the DB client's file formats
+  SqlRun.java             JDBC helper for dbclient-smoke-test.sh
 ```
 
 These folders are created when you set up, build and run jFiltra. They are not
@@ -550,6 +561,23 @@ Protection that jFiltra does provide:
 - Several hosts together can still keep all `max.connections` workers busy
   within these limits. Restrict access to the port with a firewall.
 
+## DB client
+
+`dbclient/` contains a separate client that sends database rows instead of
+files. It needs no server change: it uses the same protocol and is configured on
+the server like any other client (label, key, storage path).
+
+Each cycle runs `select.sql`, writes the rows to a file (`file.format=csv`,
+`tsv` or `jsonl`, `file.header=true|false`), sends it, and only after the
+server's `SUCCESS` runs the optional `post.transfer.sql` (for example to delete
+the rows or set a flag) and commits. Any failure rolls the transaction back.
+`run.mode=loop|once` and the exit codes are the same as for the file client.
+You provide the JDBC driver JAR. Tested with PostgreSQL, MySQL and MariaDB;
+Oracle is not tested yet.
+
+Setup, all settings, transaction and consistency rules with examples for Oracle,
+PostgreSQL and MySQL, and the behaviour on errors: **[dbclient/README.md](dbclient/README.md)**.
+
 ## Testing
 
 `test/smoke-test.sh` builds server and client, runs them in a temporary
@@ -568,8 +596,13 @@ It prints `PASS` or `FAIL` for each check and exits with code `0` when all pass.
 To run server and client with a different Java, for example Java 8, set
 `JFILTRA_TEST_JAVA=/path/to/java`.
 
+`test/dbclient-smoke-test.sh` tests the DB client against a real database; it
+needs `JFILTRA_DB_URL` and `JFILTRA_DB_DRIVER` and is skipped otherwise (see
+[dbclient/README.md](dbclient/README.md#testing)).
+
 The same test runs on GitHub on every push: on Java 8, 11, 17 and 21, and once
-with JARs built on Java 21 and run on Java 8.
+with JARs built on Java 21 and run on Java 8; the DB client test runs against
+PostgreSQL and MySQL there (GitHub service containers).
 
 ## Roadmap
 
