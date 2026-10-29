@@ -143,8 +143,10 @@ write_config() {
   } > "$D/config/dbclient.properties"
   chmod 600 "$D/config/dbclient.properties"
 }
+# DB_JAVA_OPTS: extra JVM options for run_db (e.g. -Xmx), TZ: the client's time zone
+DB_JAVA_OPTS=""
 run_db() {
-  (cd "$D" && "$JAVA" -Dlog4j2.configurationFile="$D/config/log4j2.properties" -cp "lib/*" \
+  (cd "$D" && "$JAVA" $DB_JAVA_OPTS -Dlog4j2.configurationFile="$D/config/log4j2.properties" -cp "lib/*" \
       dbclient.JFiltraDbClient config/dbclient.properties > once.log 2>&1)
   echo $?
 }
@@ -263,7 +265,10 @@ reset_table; clear_received
 write_config csv true "$SLEEP_SQL" "db.isolation=$ISO" \
   "select.sql=SELECT id, name, amount, created, note FROM jf_test WHERE sent = 0 ORDER BY id FOR UPDATE" \
   "post.transfer.sql.2=UPDATE jf_test SET sent = 1 WHERE sent = 0"
-( sleep 1.5; sql exec "INSERT INTO jf_test (id, name, sent) VALUES (7, 'inserted meanwhile', 0)" ) &
+# Insert as soon as the client has selected (not after a fixed time, which was flaky)
+: > "$D/once.log"
+( wait_for 30 grep -q "Selected .* rows into" "$D/once.log"
+  sql exec "INSERT INTO jf_test (id, name, sent) VALUES (7, 'inserted meanwhile', 0)" ) &
 INSERT_PID=$!
 code="$(run_db)"
 wait "$INSERT_PID"
@@ -288,12 +293,117 @@ check "loop: second file has only the new row" grep -q '"later"' "$WORK/received
 check "loop: all rows flagged" wait_for 5 flags_are "1|1 2|1 3|1 4|1 5|1 6|1 "
 kill "$LOOP_PID"
 check "loop: stops on SIGTERM" wait_for 15 sh -c "! kill -0 $LOOP_PID 2>/dev/null"
+wait "$LOOP_PID"; LOOP_CODE=$?
+check "loop: SIGTERM exit code 0 (was $LOOP_CODE)" [ "$LOOP_CODE" = 0 ]
 check "loop: stop logged" grep -q "JFiltraDbClient stopped" "$DB_LOG"
+
+# Without an effective post.transfer.sql the same rows are selected again: the loop
+# must still wait polling.interval.seconds between files, and warn
+reset_table; clear_received
+write_config csv true "" "run.mode=loop" "polling.interval.seconds=2"
+(cd "$D" && exec "$JAVA" -Dlog4j2.configurationFile="$D/config/log4j2.properties" -cp "lib/*" \
+    dbclient.JFiltraDbClient config/dbclient.properties > loop.log 2>&1) &
+LOOP_PID=$!
+PIDS+=("$LOOP_PID")
+wait_for 20 received_is 1
+sleep 5
+kill "$LOOP_PID"; wait "$LOOP_PID" 2>/dev/null
+check "loop without post.transfer.sql: waits between files (got $(received_count) in ~5 s)" [ "$(received_count)" -le 4 ]
+check "loop without post.transfer.sql: same content warned" grep -q "same content as the previous one" "$D/loop.log"
+
+echo "Stop during a one-time run"
+reset_table; clear_received
+write_config csv true "$SLEEP_SQL" "post.transfer.sql.2=UPDATE jf_test SET sent = 1 WHERE sent = 0"
+(cd "$D" && exec "$JAVA" -Dlog4j2.configurationFile="$D/config/log4j2.properties" -cp "lib/*" \
+    dbclient.JFiltraDbClient config/dbclient.properties > once.log 2>&1) &
+ONCE_PID=$!
+PIDS+=("$ONCE_PID")
+wait_for 20 received_is 1
+kill "$ONCE_PID"
+wait "$ONCE_PID"; ONCE_CODE=$?
+check "once: SIGTERM finishes the cycle, exit 0 (was $ONCE_CODE), rows flagged" \
+  [ "$ONCE_CODE:$(sent_flags)" = "0:1|1 2|1 3|1 4|1 5|1 " ]
+
+echo "Value types"
+# BIT(n) as bits (BIT(1) boolean), time zones kept, local times not shifted in a
+# daylight saving gap (client in Europe/Bratislava), TIME fractions, NaN and infinity
+TYPES_SQL=""
+case "$JFILTRA_DB_URL" in
+  jdbc:postgresql*)
+    TYPES_SQL="SELECT B'10101010'::bit(8) AS b8, B'1'::bit(1) AS b1, TIMESTAMPTZ '2026-10-28 19:30:05+01' AS tz, TIMETZ '19:30:05+02' AS ttz, TIMESTAMP '2026-03-29 02:30:00.5' AS gap, TIME '19:30:05.123456' AS t, 'NaN'::numeric AS nan, TIMESTAMP 'infinity' AS inf"
+    TYPES_EXPECTED='{"b8":"10101010","b1":true,"tz":"2026-10-28T18:30:05Z","ttz":"19:30:05+02:00","gap":"2026-03-29T02:30:00.5","t":"19:30:05.123456","nan":"NaN","inf":"infinity"}' ;;
+  jdbc:mysql*|jdbc:mariadb*)
+    sql try "DROP TABLE jf_types" \
+        exec "CREATE TABLE jf_types (b8 BIT(8), b1 BIT(1), gap DATETIME(1), t TIME(6), d TIME)" \
+        exec "INSERT INTO jf_types VALUES (b'10101010', b'1', '2026-03-29 02:30:00.5', '19:30:05.123456', '838:59:59')"
+    TYPES_SQL="SELECT b8, b1, gap, t, d FROM jf_types"
+    TYPES_EXPECTED='{"b8":"10101010","b1":true,"gap":"2026-03-29T02:30:00.5","t":"19:30:05.123456","d":"838:59:59"}' ;;
+esac
+if [ -n "$TYPES_SQL" ]; then
+  clear_received
+  write_config jsonl true "" "select.sql=$TYPES_SQL"
+  code="$(export TZ=Europe/Bratislava; run_db)"
+  check "value types: exit 0" [ "$code" = 0 ]
+  check "value types: written as documented" [ "$(cat "$(received_file)")" = "$TYPES_EXPECTED" ]
+  [ "$(cat "$(received_file)")" = "$TYPES_EXPECTED" ] || { echo "    expected: $TYPES_EXPECTED"; echo "    got:      $(cat "$(received_file)")"; }
+  sql try "DROP TABLE jf_types"
+fi
+
+echo "Large result"
+# With db.fetch.size (default 1000) a large result is not held in memory
+if ! echo "$JFILTRA_DB_URL" | grep -q '^jdbc:oracle'; then
+  BIG_URL="$JFILTRA_DB_URL"
+  case "$JFILTRA_DB_URL" in
+    jdbc:mysql*) case "$BIG_URL" in *\?*) BIG_URL="$BIG_URL&useCursorFetch=true" ;; *) BIG_URL="$BIG_URL?useCursorFetch=true" ;; esac ;;
+  esac
+  sql try "DROP TABLE jf_n" exec "CREATE TABLE jf_n (n INTEGER)" \
+      exec "INSERT INTO jf_n VALUES $(seq -s ',' 0 99 | sed 's/\([0-9]*\)/(\1)/g')"
+  BIG_SQL="SELECT a.n * 10000 + b.n * 100 + c.n AS id, REPEAT('x', 100) AS name FROM jf_n a, jf_n b, jf_n c"
+  clear_received
+  DB_JAVA_OPTS="-Xmx40m"
+  write_config csv false "" "db.url=$BIG_URL" "select.sql=$BIG_SQL"
+  code="$(run_db)"
+  check "1,000,000 rows with -Xmx40m: exit 0 (was $code), all rows in the file" \
+    [ "$code:$(wc -l < "$(received_file)" | tr -d ' ')" = "0:1000000" ]
+  if echo "$JFILTRA_DB_URL" | grep -q '^jdbc:postgresql'; then
+    # Without a fetch size pgjdbc reads everything into memory: logged, exit 3 (not 1)
+    clear_received
+    write_config csv false "" "select.sql=$BIG_SQL" "db.fetch.size=0"
+    code="$(run_db)"
+    check "out of memory: exit 3 (was $code), nothing sent" [ "$code:$(received_count)" = "3:0" ]
+    check "out of memory: logged in the log file" grep -q "stops after an unexpected error.*OutOfMemoryError" "$DB_LOG"
+  fi
+  DB_JAVA_OPTS=""
+  sql try "DROP TABLE jf_n"
+fi
+
+echo "Passwords not logged"
+for url in "jdbc:nosuchdb://jfuser:SECRETPW99@127.0.0.1:1/db?user=x&password=SECRETPW99" \
+           "jdbc:oracle:thin:scott/SECRETPW99@//127.0.0.1:1/ORCL"; do
+  write_config csv true "" "db.url=$url"
+  code="$(run_db)"
+  check "${url%%SECRET*}...: exit 3 (was $code), password not in the logs" \
+    [ "$code:$(cat "$DB_LOG" "$D/once.log" | grep -c SECRETPW99)" = "3:0" ]
+done
+check "masked URL logged" grep -q "jdbc:nosuchdb://jfuser:\*\*\*\*@127.0.0.1:1/db" "$DB_LOG"
+
+echo "Spool"
+reset_table; clear_received
+write_config csv true "UPDATE jf_test SET sent = 1 WHERE sent = 0"
+echo "old data" > "$D/spool/.export_20200101-000000-000.csv.tmp"
+code="$(run_db)"
+check "leftover spool file deleted at start, rows sent" [ "$code:$(ls -A "$D/spool" | wc -l | tr -d ' ')" = "0:0" ]
+check "leftover spool file logged" grep -q "Deleted spool file left by an earlier run" "$D/once.log"
 
 echo "Configuration"
 write_config xml true ""
 check "invalid file.format: exit 1" [ "$(run_db)" = 1 ]
 check "invalid file.format message" grep -q "file.format must be csv, tsv or jsonl" "$D/once.log"
+write_config csv true "" "file.prefix=nul."
+check "file.prefix the server would reject: exit 1" [ "$(run_db)" = 1 ]
+write_config csv true "" "spool.directory=$D/config/dbclient.properties"
+check "spool.directory is a file: exit 1" [ "$(run_db)" = 1 ]
+check "spool.directory message" grep -q "spool.directory is not a directory" "$D/once.log"
 write_config csv true "" "db.password.env=JFILTRA_NO_SUCH_VARIABLE"
 check "missing password variable: exit 1" [ "$(run_db)" = 1 ]
 write_config csv true ""
