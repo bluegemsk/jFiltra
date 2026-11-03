@@ -82,7 +82,7 @@ JAVAC="javac"
 [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/javac" ] && JAVAC="$JAVA_HOME/bin/javac"
 mkdir -p "$WORK/unit"
 "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/dbclient/lib/*" -d "$WORK/unit" \
-    "$ROOT/test/DbFormatTest.java" "$ROOT/test/SqlRun.java" 2>/dev/null || { echo "Test build failed"; exit 1; }
+    "$ROOT/test/DbFormatTest.java" "$ROOT/test/SqlRun.java" "$ROOT/test/HangDriver.java" 2>/dev/null || { echo "Test build failed"; exit 1; }
 
 echo "Unit tests"
 check "DB client formatting unit tests" "$JAVA" -cp "$WORK/unit:$ROOT/dbclient/lib/*" dbclient.DbFormatTest
@@ -210,7 +210,8 @@ for case in "csv true ," "csv false ;" "tsv true" "tsv false" "jsonl true"; do
   fi
   check "$fmt header=$hdr: post.transfer.sql flagged all rows" [ "$(sent_flags)" = "1|1 2|1 3|1 4|1 5|1 " ]
 done
-check "no spool files left" [ -z "$(ls -A "$D/spool")" ]
+spool_files() { ls -A "$D/spool" | grep -v '^\.export_\.lock$'; }
+check "no spool files left (only the lock file)" [ -z "$(spool_files)" ]
 
 echo "Empty select"
 clear_received
@@ -324,6 +325,53 @@ wait "$ONCE_PID"; ONCE_CODE=$?
 check "once: SIGTERM finishes the cycle, exit 0 (was $ONCE_CODE), rows flagged" \
   [ "$ONCE_CODE:$(sent_flags)" = "0:1|1 2|1 3|1 4|1 5|1 " ]
 
+echo "Second instance with the same spool directory and prefix"
+# Instance A holds the spool lock during its cycle; B must be refused and must not
+# touch A's spool file; A finishes normally (N2)
+reset_table; clear_received
+write_config csv true "$SLEEP_SQL" "post.transfer.sql.2=UPDATE jf_test SET sent = 1 WHERE sent = 0"
+: > "$D/once.log"
+(cd "$D" && exec "$JAVA" -Dlog4j2.configurationFile="$D/config/log4j2.properties" -cp "lib/*" \
+    dbclient.JFiltraDbClient config/dbclient.properties > once.log 2>&1) &
+A_PID=$!
+PIDS+=("$A_PID")
+wait_for 20 grep -q "Selected .* rows into" "$D/once.log"
+sed 's/^run.mode=once/run.mode=loop/' "$D/config/dbclient.properties" > "$D/config/loop.properties"
+chmod 600 "$D/config/loop.properties"
+(cd "$D" && exec "$JAVA" -Dlog4j2.configurationFile="$D/config/log4j2.properties" -cp "lib/*" \
+    dbclient.JFiltraDbClient config/dbclient.properties > second.log 2>&1) &
+B_PID=$!
+(cd "$D" && exec "$JAVA" -Dlog4j2.configurationFile="$D/config/log4j2.properties" -cp "lib/*" \
+    dbclient.JFiltraDbClient config/loop.properties > second-loop.log 2>&1) &
+B_LOOP_PID=$!
+PIDS+=("$B_PID" "$B_LOOP_PID")
+wait "$B_PID"; B_CODE=$?
+wait "$B_LOOP_PID"; B_LOOP_CODE=$?
+check "first instance still running while the second ones were refused" kill -0 "$A_PID"
+wait "$A_PID"; A_CODE=$?
+check "second instance (once) refused: exit 2 (was $B_CODE)" [ "$B_CODE" = 2 ]
+check "second instance (loop) refused: exit 1 (was $B_LOOP_CODE)" [ "$B_LOOP_CODE" = 1 ]
+check "second instance: reason logged" grep -qi "another instance is running with the same spool directory and prefix" "$D/second.log"
+check "second instance: first one's spool file not deleted" sh -c "! grep -q 'Deleted spool file' '$D/second.log' '$D/second-loop.log'"
+check "first instance finishes: exit 0 (was $A_CODE), one file, rows flagged" \
+  [ "$A_CODE:$(received_count):$(sent_flags)" = "0:1:1|1 2|1 3|1 4|1 5|1 " ]
+rm -f "$D/config/loop.properties"
+B_CODE="$(run_db)"
+check "after the first instance ended: lock free again (exit 2, no rows)" [ "$B_CODE" = 2 ]
+
+echo "Query timeout"
+case "$JFILTRA_DB_URL" in
+  jdbc:postgresql*) LONG_SQL="SELECT pg_sleep(5)" ;;
+  jdbc:oracle*) LONG_SQL="" ;;
+  *) LONG_SQL="SELECT COUNT(*) FROM jf_test a, jf_test b WHERE SLEEP(1) = 0" ;;
+esac
+if [ -n "$LONG_SQL" ]; then
+  write_config csv true "" "select.sql=$LONG_SQL" "db.query.timeout.seconds=1"
+  code="$(run_db)"
+  check "statement longer than db.query.timeout.seconds: exit 3 (was $code)" [ "$code" = 3 ]
+  check "query timeout named in the log" grep -q "probably db.query.timeout.seconds=1 was reached" "$DB_LOG"
+fi
+
 echo "Value types"
 # BIT(n) as bits (BIT(1) boolean), time zones kept, local times not shifted in a
 # daylight saving gap (client in Europe/Bratislava), TIME fractions, NaN and infinity
@@ -373,13 +421,42 @@ if ! echo "$JFILTRA_DB_URL" | grep -q '^jdbc:oracle'; then
     check "out of memory: exit 3 (was $code), nothing sent" [ "$code:$(received_count)" = "3:0" ]
     check "out of memory: logged in the log file" grep -q "stops after an unexpected error.*OutOfMemoryError" "$DB_LOG"
   fi
+  if echo "$JFILTRA_DB_URL" | grep -q '^jdbc:mysql' && ! echo "$JFILTRA_DB_URL" | grep -qi 'useCursorFetch=true'; then
+    # Connector/J without useCursorFetch reads everything into memory and reports the
+    # OutOfMemoryError as an SQLException: must still stop with exit 3, not hang (N1)
+    BIG2_SQL="SELECT a.n * 1000000 + b.n * 10000 + c.n * 100 + d.n AS id, REPEAT('x', 100) AS name FROM jf_n a, jf_n b, jf_n c, (SELECT n FROM jf_n WHERE n < 2) d"
+    clear_received
+    DB_JAVA_OPTS="-Xmx64m"
+    write_config csv false "" "select.sql=$BIG2_SQL"
+    start=$SECONDS
+    code="$(cd "$D" && timeout 180 "$JAVA" $DB_JAVA_OPTS -Dlog4j2.configurationFile="$D/config/log4j2.properties" \
+        -cp "lib/*" dbclient.JFiltraDbClient config/dbclient.properties > once.log 2>&1; echo $?)"
+    took=$((SECONDS - start))
+    check "Connector/J without useCursorFetch: warned at start" grep -q "without useCursorFetch=true" "$D/once.log"
+    check "Connector/J without useCursorFetch, 2,000,000 rows, -Xmx64m: exit 3 (was $code) within 180 s (took $took s), nothing sent" \
+      [ "$code:$(received_count)" = "3:0" ]
+    check "Connector/J out of memory: logged as unexpected error" grep -q "stops after an unexpected error.*OutOfMemoryError" "$DB_LOG"
+  fi
   DB_JAVA_OPTS=""
   sql try "DROP TABLE jf_n"
 fi
 
+echo "Driver error after out of memory, rollback and close never return"
+# As MySQL Connector/J after an OutOfMemoryError (N1): the client must not wait for
+# the rollback or close(), but abort the connection and exit 3
+write_config csv true "" "db.url=jdbc:hang:test"
+start=$SECONDS
+code="$(cd "$D" && timeout 60 "$JAVA" -Dlog4j2.configurationFile="$D/config/log4j2.properties" \
+    -cp "$WORK/unit:lib/*" HangDriver config/dbclient.properties > once.log 2>&1; echo $?)"
+took=$((SECONDS - start))
+check "hanging driver after 'Java heap space': exit 3 (was $code) within 60 s (took $took s)" [ "$code" = 3 ]
+check "hanging driver: connection aborted, not closed" grep -q "HangDriver: abort called" "$D/once.log"
+check "hanging driver: logged as unexpected error" grep -q "stops after an unexpected error.*OutOfMemoryError reported by the database driver" "$D/once.log"
+
 echo "Passwords not logged"
 for url in "jdbc:nosuchdb://jfuser:SECRETPW99@127.0.0.1:1/db?user=x&password=SECRETPW99" \
-           "jdbc:oracle:thin:scott/SECRETPW99@//127.0.0.1:1/ORCL"; do
+           "jdbc:oracle:thin:scott/SECRETPW99@//127.0.0.1:1/ORCL" \
+           "jdbc:sqlserver://127.0.0.1:1;databaseName=x;password={Top;SECRETPW99}"; do
   write_config csv true "" "db.url=$url"
   code="$(run_db)"
   check "${url%%SECRET*}...: exit 3 (was $code), password not in the logs" \
@@ -392,7 +469,7 @@ reset_table; clear_received
 write_config csv true "UPDATE jf_test SET sent = 1 WHERE sent = 0"
 echo "old data" > "$D/spool/.export_20200101-000000-000.csv.tmp"
 code="$(run_db)"
-check "leftover spool file deleted at start, rows sent" [ "$code:$(ls -A "$D/spool" | wc -l | tr -d ' ')" = "0:0" ]
+check "leftover spool file deleted at start, rows sent" [ "$code:$(spool_files | wc -l | tr -d ' ')" = "0:0" ]
 check "leftover spool file logged" grep -q "Deleted spool file left by an earlier run" "$D/once.log"
 
 echo "Configuration"

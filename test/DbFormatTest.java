@@ -92,6 +92,24 @@ public class DbFormatTest {
         eq(JFiltraDbClient.urlPasswords("jdbc:mysql://u:S1@h/db?password=S2").toString(), "[S1, S2]");
         eq(JFiltraDbClient.urlPasswords("jdbc:oracle:thin:scott/S3@//h:1521/X").toString(), "[S3]");
         eq(JFiltraDbClient.urlPasswords("jdbc:postgresql://h:5432/db").toString(), "[]");
+        // Brace-quoted values may contain ; and }} (N3)
+        eq(JFiltraDbClient.mask("jdbc:sqlserver://h:1433;databaseName=x;password={Top;Secret13}"),
+                "jdbc:sqlserver://h:1433;databaseName=x;password=****");
+        eq(JFiltraDbClient.mask("x;PWD={a}}b;c};db=y"), "x;PWD=****;db=y");
+        eq(JFiltraDbClient.mask("x;password={unclosed;db=y"), "x;password=****;db=y");
+        eq(JFiltraDbClient.urlPasswords("jdbc:sqlserver://h;password={Top;S}}4};db=x").toString(), "[{Top;S}}4}, Top;S}4]");
+        // Fatal errors and cancelled statements (N1, query timeout)
+        eq(String.valueOf(JFiltraDbClient.isOutOfMemory(new java.sql.SQLException("Java heap space"))), "true");
+        eq(String.valueOf(JFiltraDbClient.isOutOfMemory(new java.sql.SQLException("x", new OutOfMemoryError("y")))), "true");
+        eq(String.valueOf(JFiltraDbClient.isOutOfMemory(new java.sql.SQLException("Connection refused"))), "false");
+        eq(String.valueOf(JFiltraDbClient.isCancelled(new java.sql.SQLException("canceling statement due to user request", "57014"))), "true");
+        eq(String.valueOf(JFiltraDbClient.isCancelled(new java.sql.SQLTimeoutException("x"))), "true");
+        eq(String.valueOf(JFiltraDbClient.isCancelled(new java.sql.SQLException("syntax error", "42601"))), "false");
+        // Leftover spool files of this prefix only (N2)
+        eq(String.valueOf(JFiltraDbClient.isSpoolFileName(".export_20261028-193005-123.csv.tmp", "export_")), "true");
+        eq(String.valueOf(JFiltraDbClient.isSpoolFileName(".export_a20261028-193005-123.csv.tmp", "export_")), "false");
+        eq(String.valueOf(JFiltraDbClient.isSpoolFileName(".export_.lock", "export_")), "false");
+        eq(String.valueOf(JFiltraDbClient.isSpoolFileName(".other_20261028-193005-123.jsonl.tmp", "export_")), "false");
         Properties p = new Properties();
         p.setProperty("post.transfer.sql", "A");
         p.setProperty("post.transfer.sql.2", "B");

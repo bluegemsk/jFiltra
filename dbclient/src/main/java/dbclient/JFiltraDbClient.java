@@ -13,6 +13,9 @@ import java.math.BigDecimal;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
@@ -29,6 +32,7 @@ import java.time.OffsetDateTime;
 import java.time.OffsetTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.Executor;
 import java.util.regex.Pattern;
 import java.util.zip.Deflater;
 import java.util.zip.GZIPOutputStream;
@@ -47,7 +51,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraDbClient {
 
-    private static final String VERSION = "1.1.1";
+    private static final String VERSION = "1.1.2";
 
     private static final Logger logger = LogManager.getLogger(JFiltraDbClient.class);
 
@@ -76,6 +80,9 @@ public class JFiltraDbClient {
     // A JSON number (anything else, e.g. NaN or Infinity, is written as a string)
     private static final Pattern JSON_NUMBER = Pattern.compile("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][-+]?[0-9]+)?");
     private static final String SERVER_FILE_TOO_LARGE = "ERROR: File too large";
+    // A password=... value: {brace-quoted} (SQL Server / ODBC, may contain ; and }} for })
+    // or up to the next separator
+    private static final String PASSWORD_VALUE = "(?:\\{(?:[^}]|\\}\\})*\\}|[^&;,)\\s'\"]+)";
 
     // Server connection (as in client.properties)
     private String clientLabel;
@@ -106,6 +113,8 @@ public class JFiltraDbClient {
     private Path spoolDir;
 
     private Connection connection;
+    private FileChannel lockChannel;        // Holds the spool lock until the process ends
+    private FileLock spoolLock;
     private String lastFileName = "";
     private String lastFileHash;            // SHA-256 of the last file sent
     private volatile boolean stopping = false;
@@ -184,9 +193,20 @@ public class JFiltraDbClient {
                 throw new IllegalArgumentException("Setting spool.directory is not a directory: " + spoolDir.toAbsolutePath());
             }
             Files.createDirectories(spoolDir);
+            if (!lockSpool()) {
+                logger.error("Another instance is running with the same spool directory and prefix ("
+                        + spoolDir.resolve(lockFileName()).toAbsolutePath() + " is locked)."
+                        + (runOnce ? " Nothing done." : " Use another spool.directory or file.prefix."));
+                System.exit(runOnce ? EXIT_NOTHING_TO_SEND : EXIT_CONFIG_ERROR);
+            }
             deleteLeftoverSpoolFiles();
 
             printConfiguration();
+            if (jdbcUrl.toLowerCase(Locale.ROOT).startsWith("jdbc:mysql:")
+                    && !jdbcUrl.toLowerCase(Locale.ROOT).replace(" ", "").contains("usecursorfetch=true")) {
+                logger.warn("db.url is a MySQL Connector/J URL without useCursorFetch=true: the driver reads the whole"
+                        + " result into memory. Add ?useCursorFetch=true (see README, How a cycle works)");
+            }
         } catch (IOException | IllegalArgumentException e) {
             logger.error("Error loading configuration: " + safe(e.getMessage()));
             System.exit(EXIT_CONFIG_ERROR);
@@ -305,15 +325,49 @@ public class JFiltraDbClient {
         }
     }
 
+    /** The lock file of this spool directory and prefix, e.g. .export_.lock */
+    private String lockFileName() {
+        return "." + filePrefix + ".lock";
+    }
+
+    /**
+     * Locks the spool directory for this prefix, so two instances with the same spool
+     * directory and prefix (e.g. overlapping cron runs) can't run at the same time. The
+     * operating system releases the lock when the process ends, also after kill -9.
+     *
+     * @return false if another process holds the lock
+     */
+    private boolean lockSpool() throws IOException {
+        lockChannel = FileChannel.open(spoolDir.resolve(lockFileName()),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        try {
+            spoolLock = lockChannel.tryLock();
+        } catch (OverlappingFileLockException e) {
+            spoolLock = null;
+        }
+        if (spoolLock == null) {
+            lockChannel.close();
+            return false;
+        }
+        return true;
+    }
+
+    /** Names of this client's temporary files: .<prefix><timestamp>.<format>.tmp */
+    static boolean isSpoolFileName(String name, String prefix) {
+        return name.startsWith("." + prefix) && name.endsWith(".tmp")
+                && name.substring(1 + prefix.length()).matches("[0-9]{8}-[0-9]{6}-[0-9]{3}\\.(csv|tsv|jsonl)\\.tmp");
+    }
+
     /**
      * Deletes temporary files of this client left in the spool directory by a run that
-     * was killed. They may contain exported data.
+     * was killed. They may contain exported data. Called only while holding the spool
+     * lock, so no other instance with this prefix is writing them.
      */
     private void deleteLeftoverSpoolFiles() throws IOException {
         try (DirectoryStream<Path> files = Files.newDirectoryStream(spoolDir)) {
             for (Path file : files) {
                 String name = file.getFileName().toString();
-                if (name.startsWith("." + filePrefix) && name.endsWith(".tmp") && Files.isRegularFile(file)) {
+                if (isSpoolFileName(name, filePrefix) && Files.isRegularFile(file)) {
                     Files.delete(file);
                     logger.warn("Deleted spool file left by an earlier run: " + file);
                 }
@@ -341,7 +395,7 @@ public class JFiltraDbClient {
         }
         String s = text.replaceAll("(//[^/@\\s:]*:)[^/\\s]*@", "$1****@");
         s = s.replaceAll("(?i)(jdbc:oracle:\\w+:[^/@\\s:]+/)[^@\\s]*@", "$1****@");
-        s = s.replaceAll("(?i)(password|passwd|pwd)(\\s*[=:]\\s*)[^&;,)\\s'\"]+", "$1$2****");
+        s = s.replaceAll("(?i)(password|passwd|pwd)(\\s*[=:]\\s*)" + PASSWORD_VALUE, "$1$2****");
         return s;
     }
 
@@ -349,10 +403,15 @@ public class JFiltraDbClient {
     static List<String> urlPasswords(String url) {
         List<String> found = new ArrayList<>();
         for (String regex : new String[] {"//[^/@\\s:]*:([^/\\s]*)@", "(?i)jdbc:oracle:\\w+:[^/@\\s:]+/([^@\\s]*)@",
-                "(?i)(?:password|passwd|pwd)\\s*[=:]\\s*([^&;,)\\s'\"]+)"}) {
+                "(?i)(?:password|passwd|pwd)\\s*[=:]\\s*(" + PASSWORD_VALUE + ")"}) {
             java.util.regex.Matcher m = Pattern.compile(regex).matcher(url);
             while (m.find()) {
-                found.add(m.group(1));
+                String value = m.group(1);
+                found.add(value);
+                if (value.length() > 2 && value.startsWith("{") && value.endsWith("}")) {
+                    // Also the password itself, without the braces
+                    found.add(value.substring(1, value.length() - 1).replace("}}", "}"));
+                }
             }
         }
         return found;
@@ -516,6 +575,14 @@ public class JFiltraDbClient {
             conn.commit();
             return Outcome.SENT;
         } catch (Exception e) {
+            if (isOutOfMemory(e)) {
+                // Some drivers (MySQL Connector/J) report OutOfMemoryError as an SQLException.
+                // A rollback or close() could wait forever on the half-read result: abort
+                // the connection (the database rolls back) and stop, as for any OutOfMemoryError
+                abortConnection();
+                throw new FatalError((delivered ? "File " + fileName + " WAS DELIVERED, but then: " : "")
+                        + "OutOfMemoryError reported by the database driver: " + safe(e), e);
+            }
             rollbackQuietly();
             if (delivered) {
                 logger.error("File " + fileName + " WAS DELIVERED, but post.transfer.sql or the commit failed: " + safe(e)
@@ -523,7 +590,9 @@ public class JFiltraDbClient {
                 closeConnection();
                 return Outcome.POST_SQL_FAILED;
             }
-            logger.error("Error in database cycle (nothing sent, database rolled back): " + safe(e));
+            logger.error("Error in database cycle (nothing sent, database rolled back): " + safe(e)
+                    + (queryTimeoutSeconds > 0 && isCancelled(e) ? " (probably db.query.timeout.seconds="
+                    + queryTimeoutSeconds + " was reached)" : ""));
             closeConnection(); // Reconnect next time, in case the connection is broken
             return Outcome.TRANSFER_FAILED;
         } finally {
@@ -587,6 +656,75 @@ public class JFiltraDbClient {
                 // Nothing more to do
             }
             connection = null;
+        }
+    }
+
+    /**
+     * Closes the connection without talking to the database (no rollback that could
+     * wait forever after a fatal error); the database rolls back the open transaction.
+     */
+    private void abortConnection() {
+        if (connection != null) {
+            Connection c = connection;
+            connection = null;
+            Executor background = task -> {
+                Thread t = new Thread(task, "jdbc-abort");
+                t.setDaemon(true);
+                t.start();
+            };
+            try {
+                c.abort(background);
+            } catch (Throwable e) {
+                // Driver without abort(): close in the background, never wait for it
+                background.execute(() -> {
+                    try {
+                        c.close();
+                    } catch (Throwable ignored) {
+                        // Nothing more to do
+                    }
+                });
+            }
+        }
+    }
+
+    /** True if the error (or one of its causes) is an OutOfMemoryError or "Java heap space". */
+    static boolean isOutOfMemory(Throwable e) {
+        for (int i = 0; e != null && i < 20; e = e.getCause(), i++) {
+            if (e instanceof OutOfMemoryError
+                    || (e.getMessage() != null && e.getMessage().contains("Java heap space"))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * True if the error says the statement was cancelled or timed out (JDBC
+     * SQLTimeoutException, PostgreSQL 57014, MySQL/MariaDB 70100, "cancel..." messages).
+     */
+    static boolean isCancelled(Throwable e) {
+        for (int i = 0; e != null && i < 20; e = e.getCause(), i++) {
+            if (e instanceof SQLTimeoutException) {
+                return true;
+            }
+            if (e instanceof SQLException) {
+                String state = ((SQLException) e).getSQLState();
+                if ("57014".equals(state) || "70100".equals(state)) {
+                    return true;
+                }
+            }
+            String m = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
+            if (m.contains("cancel")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** An error after which the client stops (exit 3), like an OutOfMemoryError. */
+    static final class FatalError extends RuntimeException {
+        FatalError(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
@@ -1129,9 +1267,11 @@ public class JFiltraDbClient {
         try {
             code = client.runOnce ? client.runOnce() : client.runLoop();
         } catch (Throwable t) {
-            // E.g. OutOfMemoryError: log it (not only on stderr) and don't report a configuration error
-            client.closeConnection();
-            logger.error("JFiltraDbClient stops after an unexpected error (nothing committed): " + client.safe(t));
+            // E.g. OutOfMemoryError: log it (not only on stderr) and don't report a configuration error.
+            // Abort, not close: a close() after such an error can wait forever (Connector/J)
+            client.abortConnection();
+            logger.error("JFiltraDbClient stops after an unexpected error (nothing committed): "
+                    + (t instanceof FatalError ? t.getMessage() : client.safe(t)));
             code = EXIT_TRANSFER_FAILED;
         }
         client.exitCode = code;

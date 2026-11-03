@@ -16,6 +16,7 @@ like any other file.
 - [Setup](#setup)
 - [Configuration](#configuration)
 - [How a cycle works](#how-a-cycle-works)
+- [One instance at a time](#one-instance-at-a-time)
 - [Consistency between select and post-transfer SQL](#consistency-between-select-and-post-transfer-sql)
 - [When something fails](#when-something-fails)
 - [Output formats](#output-formats)
@@ -36,7 +37,7 @@ Tested with:
 | PostgreSQL 17.6      | `postgresql-42.7.8.jar`        | all smoke checks pass, Java 8 and 21 |
 | MariaDB 11.4.13      | `mariadb-java-client-3.5.6.jar`| all smoke checks pass, Java 8 and 21 |
 | MariaDB 11.4.13      | `mysql-connector-j-9.4.0.jar`  | all smoke checks pass, Java 8 and 21 |
-| MySQL 8.4.7          | `mysql-connector-j-9.4.0.jar`  | all smoke checks of 1.1.0 pass, Java 8 and 21 (1.1.1 not run on MySQL itself) |
+| MySQL 8.4.7          | `mysql-connector-j-9.4.0.jar`  | all smoke checks of 1.1.0 pass, Java 8 and 21 (1.1.1 and 1.1.2 not run on MySQL itself) |
 | Oracle               | `ojdbc8` / `ojdbc11`           | **not tested yet** (no Oracle database was available); the Oracle examples below follow Oracle's documented SQL |
 
 ## Setup
@@ -81,7 +82,7 @@ dbclient/
 | `db.user` | No | Database user |
 | `db.password` | No | Database password |
 | `db.fetch.size` | No | Rows the driver fetches at a time (default `1000`; `0` = the driver's default). Keeps large results out of memory, see [How a cycle works](#how-a-cycle-works) |
-| `db.query.timeout.seconds` | No | Longest time for each statement (select and post-transfer SQL), e.g. while waiting for a lock (default `0` = no limit). A statement that takes longer fails, and the cycle is rolled back |
+| `db.query.timeout.seconds` | No | Longest time for each statement (select and post-transfer SQL), e.g. while waiting for a lock (default `0` = no limit). A statement that takes longer fails, and the cycle is rolled back. When a cancelled select is logged, the log adds `probably db.query.timeout.seconds=N was reached` (PostgreSQL itself only says `canceling statement due to user request`) |
 | `db.isolation` | No | Transaction isolation: `read_committed`, `repeatable_read` or `serializable`; empty = the database's default. See [Consistency](#consistency-between-select-and-post-transfer-sql) |
 | `db.password.env` | No | Name of an environment variable holding the password; used instead of `db.password`. The client doesn't start if the variable is not set |
 | `select.sql` | Yes | One `SELECT`. All its rows go into one file. No trailing semicolon |
@@ -93,7 +94,7 @@ dbclient/
 | `file.header` | No | `true` (default) or `false`: first line with the column names (csv and tsv) |
 | `csv.delimiter` | No | CSV field delimiter: one character (default `,`), `tab` or `space` (also `\\t` and `\\s`, see the backslash note below). Spaces around the value are ignored. Not `"`, a line break, a letter or a digit |
 | `file.prefix` | No | Start of the file name (default `export_`). At most 200 bytes; no `/ \ : * ? " < > \|`, control characters or leading dot; must not make a name the server refuses, e.g. `nul.` or `COM1.` (Windows device names) |
-| `spool.directory` | No | Where the file is written before it is sent (default `spool`); it is deleted afterwards. Use one spool directory per DB client |
+| `spool.directory` | No | Where the file is written before it is sent (default `spool`); it is deleted afterwards. Use one spool directory per DB client. Only one instance can run per spool directory and `file.prefix`, see [One instance at a time](#one-instance-at-a-time) |
 
 The values of `run.mode`, `file.format` and `file.header` are not
 case-sensitive. An invalid value stops the client with exit code `1` and a clear
@@ -128,7 +129,8 @@ database password. The client logs a warning if the file is readable by all
 users. Keep it at `chmod 600`, or put the password into an environment variable
 (`db.password.env`), for example with `Environment=` in a systemd unit. The log
 shows the database URL without its parameters. Passwords in a URL
-(`user:password@`, Oracle's `user/password@`, `password=...`) and the passwords
+(`user:password@`, Oracle's `user/password@`, `password=...`, also brace-quoted
+values such as `password={Top;Secret}`) and the passwords
 from `db.password`, `db.password.env` and `db.url` (4 characters or longer) are
 replaced by `****` in every logged line, including database error messages.
 
@@ -167,13 +169,37 @@ time, so memory use doesn't grow with the result size:
 - PostgreSQL (pgjdbc), MariaDB driver, Oracle: `db.fetch.size` is enough.
 - MySQL Connector/J reads the whole result into memory unless the URL has
   `useCursorFetch=true`, e.g. `jdbc:mysql://host:3306/db?useCursorFetch=true`.
+  The client logs a warning at start if a `jdbc:mysql:` URL doesn't have it.
 
 If the client runs out of memory anyway (or hits any other unexpected error), it
 logs `JFiltraDbClient stops after an unexpected error`, nothing is committed, and
-it exits with `3`.
+it exits with `3`. This includes drivers that report the `OutOfMemoryError` as a
+database error (Connector/J: `SQLException: Java heap space`). After such an
+error the client aborts the database connection instead of closing it (a normal
+close would wait for a rollback the driver may never finish); the database rolls
+the open transaction back.
 
 The transaction stays open while the file is sent. If `select.sql` locks rows
 (`FOR UPDATE`), they stay locked until the commit.
+
+## One instance at a time
+
+Two DB clients with the same `spool.directory` and `file.prefix` can't run at the
+same time, for example when cron starts a `once` run while the previous one is
+still busy. At start the client locks the file `.<prefix>.lock` in the spool
+directory (e.g. `spool/.export_.lock`). If another instance holds the lock, it
+logs `Another instance is running with the same spool directory and prefix` and
+exits: `once` with `2` (nothing done, like an empty select, so the next cron run
+simply tries again), `loop` with `1`. The lock is released when the process ends,
+also after `kill -9`; the lock file itself stays and can be ignored. Use a local
+file system for the spool directory (locks on network file systems may not work).
+
+Leftover temporary files of a killed run (`.<prefix><timestamp>.<format>.tmp`)
+are deleted at start only while holding the lock, so a running instance's file
+is never deleted. Files of other prefixes are left alone.
+
+To run several DB clients from one installation at the same time, give each its
+own `spool.directory` or `file.prefix`.
 
 ## Consistency between select and post-transfer SQL
 
@@ -258,7 +284,8 @@ Notes:
 | Server replies `File too large` | rolled back, unchanged | not stored | `once`: exit `3`; `loop`: tries again after 10 minutes |
 | Connection lost after the file was sent, before the server's reply (e.g. `socket.timeout.seconds` too short) | rolled back, unchanged | **may be stored** | as for an unreachable server; the same rows are sent again later under a new file name, so the receiver may get them twice |
 | Post-transfer SQL or commit fails | rolled back, unchanged | **stored on the server** | logs `ERROR ... WAS DELIVERED, but post.transfer.sql or the commit failed`; `once`: exit `3`; `loop`: **stops with exit `3`** |
-| Unexpected error (e.g. out of memory) | not committed | not stored, or stored if it happened after the reply | logs `stops after an unexpected error`; exit `3` |
+| Unexpected error (e.g. out of memory, also when the driver reports it as a database error) | not committed (connection aborted, the database rolls back) | not stored, or stored if it happened after the reply | logs `stops after an unexpected error`; exit `3` |
+| Another instance runs with the same spool directory and prefix | unchanged | not sent | logs `Another instance is running ...`; `once`: exit `2`; `loop`: exit `1` |
 
 **Possible duplicates.** If the server's reply is lost, the client can't know
 that the file was stored, so it sends the rows again. Whatever reads the files
@@ -354,8 +381,8 @@ The same as the file client's `run.mode=once`:
 | Code | Meaning |
 |------|---------|
 | `0` | `once`: the rows were sent and committed. `loop`: stopped normally (Ctrl+C, SIGTERM, `systemctl stop`) |
-| `1` | Configuration error (missing or invalid setting, missing password variable, missing config file, no UTF-8 locale) |
-| `2` | `once`: the select returned no rows |
+| `1` | Configuration error (missing or invalid setting, missing password variable, missing config file, no UTF-8 locale). `loop`: another instance runs with the same spool directory and prefix |
+| `2` | `once`: the select returned no rows, or another instance runs with the same spool directory and prefix (nothing done) |
 | `3` | `once`: the select, the transfer, the post-transfer SQL or the commit failed. `loop`: stopped after a failed post-transfer SQL or commit. Both: unexpected error such as out of memory |
 
 A missing JDBC driver shows up as `No suitable driver found for jdbc:...` and,
@@ -390,5 +417,10 @@ stopping on SIGTERM with exit code `0`, the pause between cycles without an
 effective post-transfer SQL, finishing a one-time run on SIGTERM, value types
 (`BIT(n)`, time zones, a daylight saving gap, `TIME` fractions, `NaN`, `infinity`),
 a result of 1,000,000 rows with a 40 MB heap (and, on PostgreSQL, the logged
-exit `3` when it runs out of memory without a fetch size), passwords masked in
-the log, leftover spool files, and configuration errors.
+exit `3` when it runs out of memory without a fetch size; with Connector/J
+without `useCursorFetch=true`, the start warning and exit `3` with a 64 MB heap),
+a driver whose rollback and close never return after an out-of-memory error
+(exit `3`, connection aborted), a second instance with the same spool directory
+and prefix (refused with exit `2` / `1`, the first one finishes), a statement
+cancelled by `db.query.timeout.seconds`, passwords masked in the log (also
+brace-quoted), leftover spool files, and configuration errors.
