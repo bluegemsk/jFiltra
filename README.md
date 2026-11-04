@@ -2,6 +2,7 @@
 
 jFiltra is a lightweight Java client/server tool for moving files from watched
 directories to a central server, reliably and with as little setup as possible.
+Current version: **1.1.4** (server, client and DB client share the version).
 
 - The **client** polls one or more source directories. For each file it computes a
   SHA-256 hash, compresses the file with GZIP, scrambles it with AES using a
@@ -575,6 +576,17 @@ the rows or set a flag) and commits. Any failure rolls the transaction back.
 You provide the JDBC driver JAR. Tested with PostgreSQL, MySQL and MariaDB;
 Oracle is not tested yet.
 
+- `post.transfer.sql.2`, `.3`, … add more statements, run in order in the same
+  transaction.
+- `db.isolation` sets the transaction isolation level (default: the database's
+  own), `db.fetch.size` the rows fetched at a time (default `1000`, so large
+  results don't fill memory), and `db.query.timeout.seconds` the longest time
+  per statement (default `0` = no limit).
+- Only one instance can run per `spool.directory` and `file.prefix`; a second
+  one is refused (exit `2` in `once` mode, `1` in `loop` mode).
+- Passwords in JDBC URLs and error messages (`user:pass@`, `password=…` and
+  parameters ending in `password`, `passwd` or `pwd`) are masked in the logs.
+
 Setup, all settings, transaction and consistency rules with examples for Oracle,
 PostgreSQL and MySQL, and the behaviour on errors: **[dbclient/README.md](dbclient/README.md)**.
 
@@ -606,7 +618,7 @@ PostgreSQL and MySQL there (GitHub service containers).
 
 ## Roadmap
 
-Ideas for later versions, kept out of 1.0 to keep jFiltra simple:
+Ideas for later versions, kept out so far to keep jFiltra simple:
 
 - Scanning subdirectories of the source directories
 - Moving sent files to a `sent/` directory instead of deleting them
