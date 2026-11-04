@@ -51,7 +51,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraDbClient {
 
-    private static final String VERSION = "1.1.2";
+    private static final String VERSION = "1.1.3";
 
     private static final Logger logger = LogManager.getLogger(JFiltraDbClient.class);
 
@@ -80,9 +80,9 @@ public class JFiltraDbClient {
     // A JSON number (anything else, e.g. NaN or Infinity, is written as a string)
     private static final Pattern JSON_NUMBER = Pattern.compile("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][-+]?[0-9]+)?");
     private static final String SERVER_FILE_TOO_LARGE = "ERROR: File too large";
-    // A password=... value: {brace-quoted} (SQL Server / ODBC, may contain ; and }} for })
-    // or up to the next separator
-    private static final String PASSWORD_VALUE = "(?:\\{(?:[^}]|\\}\\})*\\}|[^&;,)\\s'\"]+)";
+    // Keywords of password=... values in logged text (see passwordValues)
+    private static final String[] PASSWORD_KEYWORDS = {"password", "passwd", "pwd"};
+    private static final String MASKING_FAILED = "(message hidden: masking failed)";
 
     // Server connection (as in client.properties)
     private String clientLabel;
@@ -202,8 +202,7 @@ public class JFiltraDbClient {
             deleteLeftoverSpoolFiles();
 
             printConfiguration();
-            if (jdbcUrl.toLowerCase(Locale.ROOT).startsWith("jdbc:mysql:")
-                    && !jdbcUrl.toLowerCase(Locale.ROOT).replace(" ", "").contains("usecursorfetch=true")) {
+            if (jdbcUrl.toLowerCase(Locale.ROOT).startsWith("jdbc:mysql:") && !hasCursorFetch(jdbcUrl)) {
                 logger.warn("db.url is a MySQL Connector/J URL without useCursorFetch=true: the driver reads the whole"
                         + " result into memory. Add ?useCursorFetch=true (see README, How a cycle works)");
             }
@@ -337,19 +336,59 @@ public class JFiltraDbClient {
      *
      * @return false if another process holds the lock
      */
-    private boolean lockSpool() throws IOException {
-        lockChannel = FileChannel.open(spoolDir.resolve(lockFileName()),
-                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+    private boolean lockSpool() {
+        Path lockFile = spoolDir.resolve(lockFileName());
         try {
-            spoolLock = lockChannel.tryLock();
-        } catch (OverlappingFileLockException e) {
-            spoolLock = null;
+            if (lockFile.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+                // rw------- when the file is created (an existing lock file keeps its mode)
+                lockChannel = FileChannel.open(lockFile, EnumSet.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE),
+                        PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
+            } else {
+                lockChannel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            }
+            try {
+                spoolLock = lockChannel.tryLock();
+            } catch (OverlappingFileLockException e) {
+                spoolLock = null;
+            }
+        } catch (IOException e) {
+            logger.error(lockErrorMessage(lockFile, e));
+            System.exit(EXIT_CONFIG_ERROR);
+            return false; // Not reached
         }
         if (spoolLock == null) {
-            lockChannel.close();
+            try {
+                lockChannel.close();
+            } catch (IOException ignored) {
+                // Nothing more to do
+            }
             return false;
         }
         return true;
+    }
+
+    /** The log message when the spool lock file can't be created, opened or locked (A3). */
+    static String lockErrorMessage(Path lockFile, IOException e) {
+        String reason;
+        if (Files.isDirectory(lockFile)) {
+            reason = "it is a directory. Remove it or use another file.prefix";
+        } else if (e instanceof AccessDeniedException) {
+            reason = "permission denied. The user running the client needs write access to spool.directory"
+                    + (Files.exists(lockFile) ? " and to this file" : "");
+        } else {
+            String m = e.getMessage();
+            if (e instanceof FileSystemException && ((FileSystemException) e).getReason() != null) {
+                m = ((FileSystemException) e).getReason();
+            }
+            reason = (m == null ? e.getClass().getSimpleName() : m)
+                    + ". The user running the client needs write access to spool.directory";
+        }
+        return "Cannot create or lock spool lock file " + lockFile.toAbsolutePath() + ": " + reason + ".";
+    }
+
+    /** True if a MySQL Connector/J URL sets useCursorFetch to true (or yes). */
+    static boolean hasCursorFetch(String url) {
+        return Pattern.compile("(?i)usecursorfetch\\s*=\\s*(true|yes)(?![a-z0-9])").matcher(url).find();
     }
 
     /** Names of this client's temporary files: .<prefix><timestamp>.<format>.tmp */
@@ -395,23 +434,109 @@ public class JFiltraDbClient {
         }
         String s = text.replaceAll("(//[^/@\\s:]*:)[^/\\s]*@", "$1****@");
         s = s.replaceAll("(?i)(jdbc:oracle:\\w+:[^/@\\s:]+/)[^@\\s]*@", "$1****@");
-        s = s.replaceAll("(?i)(password|passwd|pwd)(\\s*[=:]\\s*)" + PASSWORD_VALUE, "$1$2****");
-        return s;
+        List<int[]> values = passwordValues(s);
+        if (values.isEmpty()) {
+            return s;
+        }
+        StringBuilder out = new StringBuilder(s.length());
+        int copied = 0;
+        for (int[] v : values) {
+            out.append(s, copied, v[0]).append("****");
+            copied = v[1];
+        }
+        return out.append(s, copied, s.length()).toString();
+    }
+
+    /**
+     * Finds the values of password=..., passwd=... and pwd=... (any case, also with ":"
+     * and spaces around it). The keyword must be a whole word (letters and digits around
+     * it don't count; "_" and "." separate words, as in db_password=...). A value is
+     * either {brace-quoted} (SQL Server / ODBC: may contain ; and }} for }) or runs up to
+     * the next separator (&amp; ; , ) ' " or white space). A simple scan, no regular
+     * expression: works for text of any length.
+     *
+     * @return [start, end) of each value, in order
+     */
+    static List<int[]> passwordValues(String s) {
+        List<int[]> found = new ArrayList<>();
+        int n = s.length();
+        int i = 0;
+        while (i < n) {
+            int keyword = 0;
+            if (i == 0 || !Character.isLetterOrDigit(s.charAt(i - 1))) {
+                for (String k : PASSWORD_KEYWORDS) {
+                    if (s.regionMatches(true, i, k, 0, k.length())) {
+                        keyword = k.length();
+                        break;
+                    }
+                }
+            }
+            if (keyword == 0) {
+                i++;
+                continue;
+            }
+            int j = i + keyword;
+            while (j < n && isRegexSpace(s.charAt(j))) {
+                j++;
+            }
+            if (j >= n || (s.charAt(j) != '=' && s.charAt(j) != ':')) {
+                i += keyword; // Not followed by = or : (also "passwords", "pwdx")
+                continue;
+            }
+            j++;
+            while (j < n && isRegexSpace(s.charAt(j))) {
+                j++;
+            }
+            int end = -1;
+            if (j < n && s.charAt(j) == '{') {
+                for (int k = j + 1; k < n; k++) {
+                    if (s.charAt(k) == '}') {
+                        if (k + 1 < n && s.charAt(k + 1) == '}') {
+                            k++; // }} stands for }
+                        } else {
+                            end = k + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (end < 0) {
+                // Not brace-quoted (or no closing brace): up to the next separator
+                end = j;
+                while (end < n && "&;,)'\"".indexOf(s.charAt(end)) < 0 && !isRegexSpace(s.charAt(end))) {
+                    end++;
+                }
+            }
+            if (end > j) {
+                found.add(new int[] {j, end});
+                i = end;
+            } else {
+                i = j;
+            }
+        }
+        return found;
+    }
+
+    /** The characters of \\s in a regular expression. */
+    private static boolean isRegexSpace(char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\u000B' || c == '\f' || c == '\r';
     }
 
     /** The passwords written in a JDBC URL (the forms {@link #mask(String)} knows). */
     static List<String> urlPasswords(String url) {
         List<String> found = new ArrayList<>();
-        for (String regex : new String[] {"//[^/@\\s:]*:([^/\\s]*)@", "(?i)jdbc:oracle:\\w+:[^/@\\s:]+/([^@\\s]*)@",
-                "(?i)(?:password|passwd|pwd)\\s*[=:]\\s*(" + PASSWORD_VALUE + ")"}) {
+        for (String regex : new String[] {"//[^/@\\s:]*:([^/\\s]*)@", "(?i)jdbc:oracle:\\w+:[^/@\\s:]+/([^@\\s]*)@"}) {
             java.util.regex.Matcher m = Pattern.compile(regex).matcher(url);
             while (m.find()) {
-                String value = m.group(1);
-                found.add(value);
-                if (value.length() > 2 && value.startsWith("{") && value.endsWith("}")) {
-                    // Also the password itself, without the braces
-                    found.add(value.substring(1, value.length() - 1).replace("}}", "}"));
-                }
+                found.add(m.group(1));
+            }
+        }
+        for (int[] v : passwordValues(url)) {
+            String value = url.substring(v[0], v[1]);
+            found.add(value);
+            if (value.length() > 2 && value.startsWith("{") && value.endsWith("}")) {
+                // Also the password itself, without the braces
+                found.add(value.substring(1, value.length() - 1).replace("}}", "}"));
             }
         }
         return found;
@@ -422,13 +547,42 @@ public class JFiltraDbClient {
      * wherever they appear (some drivers quote parts of the URL in their messages).
      */
     private String safe(Object text) {
-        String s = mask(String.valueOf(text));
-        for (String secret : secrets) {
-            if (secret != null && secret.length() >= 4) {
-                s = s.replace(secret, "****");
+        return safe(text, secrets);
+    }
+
+    /** {@link #safe(Object)} with the given secrets. Never throws. */
+    static String safe(Object text, List<String> secrets) {
+        try {
+            String s = mask(String.valueOf(text));
+            for (String secret : secrets) {
+                if (secret != null && secret.length() >= 4) {
+                    s = replaceLiteral(s, secret, "****");
+                }
             }
+            return s;
+        } catch (Throwable e) {
+            // Never lose the error being logged because masking failed (A1): keep its class only
+            return text instanceof Throwable ? text.getClass().getName() + ": " + MASKING_FAILED : MASKING_FAILED;
         }
-        return s;
+    }
+
+    /**
+     * String.replace without a regular expression: Java 8's String.replace compiles the
+     * target as a pattern, which takes very long for a long target (e.g. a long password).
+     */
+    static String replaceLiteral(String s, String target, String replacement) {
+        int at = s.indexOf(target);
+        if (at < 0) {
+            return s;
+        }
+        StringBuilder out = new StringBuilder(s.length());
+        int copied = 0;
+        while (at >= 0) {
+            out.append(s, copied, at).append(replacement);
+            copied = at + target.length();
+            at = s.indexOf(target, copied);
+        }
+        return out.append(s, copied, s.length()).toString();
     }
 
     private static void warnIfReadableByOthers(Path config) {
@@ -586,13 +740,12 @@ public class JFiltraDbClient {
             rollbackQuietly();
             if (delivered) {
                 logger.error("File " + fileName + " WAS DELIVERED, but post.transfer.sql or the commit failed: " + safe(e)
-                        + ". The database was rolled back, so the same rows would be selected and sent again.");
+                        + ". The database was rolled back, so the same rows would be selected and sent again."
+                        + timeoutHint(e));
                 closeConnection();
                 return Outcome.POST_SQL_FAILED;
             }
-            logger.error("Error in database cycle (nothing sent, database rolled back): " + safe(e)
-                    + (queryTimeoutSeconds > 0 && isCancelled(e) ? " (probably db.query.timeout.seconds="
-                    + queryTimeoutSeconds + " was reached)" : ""));
+            logger.error("Error in database cycle (nothing sent, database rolled back): " + safe(e) + timeoutHint(e));
             closeConnection(); // Reconnect next time, in case the connection is broken
             return Outcome.TRANSFER_FAILED;
         } finally {
@@ -604,6 +757,13 @@ public class JFiltraDbClient {
                 }
             }
         }
+    }
+
+    /** A line naming db.query.timeout.seconds if the error is a statement timeout, else "". */
+    private String timeoutHint(Throwable e) {
+        return queryTimeoutSeconds > 0 && isTimeout(e)
+                ? System.lineSeparator() + "(probably db.query.timeout.seconds=" + queryTimeoutSeconds + " was reached)"
+                : "";
     }
 
     /** A statement with db.fetch.size and db.query.timeout.seconds applied. */
@@ -687,11 +847,15 @@ public class JFiltraDbClient {
         }
     }
 
-    /** True if the error (or one of its causes) is an OutOfMemoryError or "Java heap space". */
+    /**
+     * True if the error (or one of its causes) is an OutOfMemoryError, or a driver's
+     * exception whose whole message is that of one ("Java heap space", "GC overhead limit
+     * exceeded"). Not for messages that only contain these words (e.g. a quoted value).
+     */
     static boolean isOutOfMemory(Throwable e) {
         for (int i = 0; e != null && i < 20; e = e.getCause(), i++) {
-            if (e instanceof OutOfMemoryError
-                    || (e.getMessage() != null && e.getMessage().contains("Java heap space"))) {
+            String m = e.getMessage() == null ? "" : e.getMessage().trim();
+            if (e instanceof OutOfMemoryError || m.equals("Java heap space") || m.equals("GC overhead limit exceeded")) {
                 return true;
             }
         }
@@ -699,10 +863,10 @@ public class JFiltraDbClient {
     }
 
     /**
-     * True if the error says the statement was cancelled or timed out (JDBC
-     * SQLTimeoutException, PostgreSQL 57014, MySQL/MariaDB 70100, "cancel..." messages).
+     * True if the error (or one of its causes) is a statement timeout: JDBC
+     * SQLTimeoutException, or SQLState 57014 (PostgreSQL) or 70100 (MySQL/MariaDB).
      */
-    static boolean isCancelled(Throwable e) {
+    static boolean isTimeout(Throwable e) {
         for (int i = 0; e != null && i < 20; e = e.getCause(), i++) {
             if (e instanceof SQLTimeoutException) {
                 return true;
@@ -712,10 +876,6 @@ public class JFiltraDbClient {
                 if ("57014".equals(state) || "70100".equals(state)) {
                     return true;
                 }
-            }
-            String m = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
-            if (m.contains("cancel")) {
-                return true;
             }
         }
         return false;

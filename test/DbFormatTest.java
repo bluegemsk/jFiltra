@@ -102,9 +102,55 @@ public class DbFormatTest {
         eq(String.valueOf(JFiltraDbClient.isOutOfMemory(new java.sql.SQLException("Java heap space"))), "true");
         eq(String.valueOf(JFiltraDbClient.isOutOfMemory(new java.sql.SQLException("x", new OutOfMemoryError("y")))), "true");
         eq(String.valueOf(JFiltraDbClient.isOutOfMemory(new java.sql.SQLException("Connection refused"))), "false");
-        eq(String.valueOf(JFiltraDbClient.isCancelled(new java.sql.SQLException("canceling statement due to user request", "57014"))), "true");
-        eq(String.valueOf(JFiltraDbClient.isCancelled(new java.sql.SQLTimeoutException("x"))), "true");
-        eq(String.valueOf(JFiltraDbClient.isCancelled(new java.sql.SQLException("syntax error", "42601"))), "false");
+        eq(String.valueOf(JFiltraDbClient.isTimeout(new java.sql.SQLException("canceling statement due to user request", "57014"))), "true");
+        eq(String.valueOf(JFiltraDbClient.isTimeout(new java.sql.SQLTimeoutException("x"))), "true");
+        eq(String.valueOf(JFiltraDbClient.isTimeout(new java.sql.SQLException("syntax error", "42601"))), "false");
+        // Long brace-quoted text: no StackOverflowError (A1)
+        String longText = new String(new char[1000000]).replace('\0', 'x');
+        eq(JFiltraDbClient.mask("bad value: \"note password={" + longText + "}\" at 1"), "bad value: \"note password=****\" at 1");
+        eq(JFiltraDbClient.mask("bad value: \"note pwd={" + longText + "\""), "bad value: \"note pwd=****\"");
+        eq(JFiltraDbClient.mask("PWD = {" + longText + "}} ;x"), "PWD = **** ;x");
+        eq(String.valueOf(JFiltraDbClient.urlPasswords("jdbc:x://h;password={" + longText + "}").size()), "2");
+        eq(JFiltraDbClient.replaceLiteral("a" + longText + "b" + longText, longText, "*"), "a*b*");
+        eq(JFiltraDbClient.replaceLiteral("abcabc", "bc", "*"), "a*a*");
+        // Masking that fails never hides the error class (A1 safety net)
+        java.sql.SQLException broken = new java.sql.SQLException("x") {
+            @Override
+            public String getMessage() {
+                throw new StackOverflowError();
+            }
+        };
+        eq(JFiltraDbClient.safe(broken, java.util.Collections.<String>emptyList()),
+                broken.getClass().getName() + ": (message hidden: masking failed)");
+        eq(JFiltraDbClient.safe(new java.sql.SQLException("pwd=abcd; user abcd"), java.util.Arrays.asList("abcd")),
+                "java.sql.SQLException: pwd=****; user ****");
+        // Keywords only as whole words (A1)
+        eq(JFiltraDbClient.mask("mypwd=abc;oldpassword=abc;passwords=abc"), "mypwd=abc;oldpassword=abc;passwords=abc");
+        eq(JFiltraDbClient.mask("db.password=abc db_pwd=abc (passwd:abc)"), "db.password=**** db_pwd=**** (passwd:****)");
+        eq(JFiltraDbClient.mask("password=  "), "password=  ");
+        eq(JFiltraDbClient.mask("password={}"), "password=****");
+        eq(JFiltraDbClient.mask("password={{inner}}}"), "password=****");
+        eq(JFiltraDbClient.mask("Password: {Top;Secret} more"), "Password: **** more");
+        eq(JFiltraDbClient.mask("PASSWORD={x};password=plain"), "PASSWORD=****;password=****");
+        // Timeout hint only for real timeouts (A2)
+        eq(String.valueOf(JFiltraDbClient.isTimeout(new java.sql.SQLException("relation \"cancelled_orders\" does not exist", "42P01"))), "false");
+        eq(String.valueOf(JFiltraDbClient.isTimeout(new java.sql.SQLException("Statement cancelled due to client request"))), "false");
+        eq(String.valueOf(JFiltraDbClient.isTimeout(new java.sql.SQLException("max_statement_time exceeded", "70100"))), "true");
+        eq(String.valueOf(JFiltraDbClient.isTimeout(new RuntimeException(new java.sql.SQLException("x", "57014")))), "true");
+        // Out of memory only from OutOfMemoryError or the exact message (observation)
+        eq(String.valueOf(JFiltraDbClient.isOutOfMemory(new java.sql.SQLException("GC overhead limit exceeded"))), "true");
+        eq(String.valueOf(JFiltraDbClient.isOutOfMemory(new java.sql.SQLException("invalid input syntax: \"Java heap space\""))), "false");
+        // useCursorFetch=true or yes (observation)
+        eq(String.valueOf(JFiltraDbClient.hasCursorFetch("jdbc:mysql://h/db?useCursorFetch=true")), "true");
+        eq(String.valueOf(JFiltraDbClient.hasCursorFetch("jdbc:mysql://h/db?a=1&USECURSORFETCH=YES")), "true");
+        eq(String.valueOf(JFiltraDbClient.hasCursorFetch("jdbc:mysql://h/db?useCursorFetch=false")), "false");
+        eq(String.valueOf(JFiltraDbClient.hasCursorFetch("jdbc:mysql://h/db?useCursorFetch=yesno")), "false");
+        eq(String.valueOf(JFiltraDbClient.hasCursorFetch("jdbc:mysql://h/db")), "false");
+        // Lock file errors (A3)
+        java.nio.file.Path lock = java.nio.file.Paths.get("spool/.export_.lock");
+        eq(JFiltraDbClient.lockErrorMessage(lock, new java.nio.file.AccessDeniedException(lock.toString())),
+                "Cannot create or lock spool lock file " + lock.toAbsolutePath()
+                + ": permission denied. The user running the client needs write access to spool.directory.");
         // Leftover spool files of this prefix only (N2)
         eq(String.valueOf(JFiltraDbClient.isSpoolFileName(".export_20261028-193005-123.csv.tmp", "export_")), "true");
         eq(String.valueOf(JFiltraDbClient.isSpoolFileName(".export_a20261028-193005-123.csv.tmp", "export_")), "false");

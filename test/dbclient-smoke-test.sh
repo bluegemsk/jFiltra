@@ -370,7 +370,87 @@ if [ -n "$LONG_SQL" ]; then
   code="$(run_db)"
   check "statement longer than db.query.timeout.seconds: exit 3 (was $code)" [ "$code" = 3 ]
   check "query timeout named in the log" grep -q "probably db.query.timeout.seconds=1 was reached" "$DB_LOG"
+  check "query timeout hint on its own line" grep -q "^(probably db.query.timeout.seconds=1 was reached)" "$D/once.log"
+  # Timeout in post.transfer.sql: the hint also in the "WAS DELIVERED" message (A4)
+  reset_table; clear_received
+  write_config csv true "$LONG_SQL" "db.query.timeout.seconds=1"
+  code="$(run_db)"
+  check "post.transfer.sql timeout: exit 3 (was $code), file delivered" [ "$code:$(received_count)" = "3:1" ]
+  check "post.transfer.sql timeout: logged as delivered" grep -q "WAS DELIVERED, but post.transfer.sql or the commit failed" "$D/once.log"
+  check "post.transfer.sql timeout: hint logged" grep -q "^(probably db.query.timeout.seconds=1 was reached)" "$D/once.log"
 fi
+# Other errors get no timeout hint, even if they contain "cancel" (A2)
+write_config csv true "" "select.sql=SELECT id FROM cancelled_orders" "db.query.timeout.seconds=2"
+code="$(run_db)"
+check "missing table cancelled_orders: exit 3 (was $code)" [ "$code" = 3 ]
+check "missing table cancelled_orders: error logged" grep -qi "cancelled_orders" "$D/once.log"
+check "missing table cancelled_orders: no timeout hint" sh -c "! grep -q 'probably db.query.timeout' '$D/once.log'"
+
+echo "Long text after password={ in an error message"
+# Masking must work for any length (A1): the real error is logged, value masked,
+# and the loop keeps retrying. The database error quotes the value (PostgreSQL); for
+# every database a driver error quotes a long db.url
+LONG_X="$(head -c 1000000 /dev/zero | tr '\0' x)"
+long_password_checks() { # <label>
+  local label="$1"
+  write_config csv true "" "$LONG_CONFIG" "$LONG_SELECT"
+  code="$(run_db)"
+  check "$label, once: exit 3 (was $code)" [ "$code" = 3 ]
+  check "$label, once: real error logged with the value masked" grep -q "$LONG_EXPECT" "$D/once.log"
+  check "$label, once: no StackOverflowError" sh -c "! grep -q StackOverflowError '$D/once.log'"
+  check "$label, once: password text not logged" sh -c "! grep -q xxxxxxxxxx '$D/once.log'"
+  sed -i 's/^run.mode=.*/run.mode=loop/' "$D/config/dbclient.properties"
+  (cd "$D" && exec "$JAVA" -Dlog4j2.configurationFile="$D/config/log4j2.properties" -cp "lib/*" \
+      dbclient.JFiltraDbClient config/dbclient.properties > loop.log 2>&1) &
+  LOOP_PID=$!
+  PIDS+=("$LOOP_PID")
+  check "$label, loop: error logged twice (keeps retrying)" \
+    wait_for 30 sh -c "[ \$(grep -c '$LONG_EXPECT' '$D/loop.log') -ge 2 ]"
+  check "$label, loop: still running" kill -0 "$LOOP_PID"
+  check "$label, loop: no StackOverflowError" sh -c "! grep -q StackOverflowError '$D/loop.log'"
+  kill "$LOOP_PID"; wait "$LOOP_PID" 2>/dev/null
+}
+LONG_CONFIG="db.url=jdbc:nosuchdb://127.0.0.1:1/db;password={$LONG_X}"
+LONG_SELECT="db.fetch.size=1000"
+LONG_EXPECT="No suitable driver.*password=\*\*\*\*"
+long_password_checks "1,000,000 characters after password={ in db.url"
+if echo "$JFILTRA_DB_URL" | grep -q '^jdbc:postgresql'; then
+  sql try "DROP TABLE jf_soe" exec "CREATE TABLE jf_soe (id INTEGER, v TEXT, sent INTEGER)" \
+      exec "INSERT INTO jf_soe VALUES (1, 'note password={' || repeat('x', 1000000) || '}', 0)"
+  LONG_CONFIG="db.fetch.size=1000"
+  LONG_SELECT="select.sql=SELECT id, CAST(v AS INTEGER) AS n FROM jf_soe WHERE sent = 0"
+  LONG_EXPECT="invalid input syntax for type integer: \"note password=\*\*\*\*\""
+  long_password_checks "1,000,000 characters after password={ in a database error"
+  sql try "DROP TABLE jf_soe"
+fi
+
+echo "Lock file errors"
+# A spool directory without write permission, a read-only lock file, a directory
+# with the lock file's name: clear message, exit 1 (A3). Not as root (root may write anyway)
+if [ "$(id -u)" != 0 ]; then
+  mkdir -p "$D/lockspool"
+  write_config csv true "" "spool.directory=$D/lockspool"
+  chmod 500 "$D/lockspool"
+  code="$(run_db)"
+  check "spool directory not writable: exit 1 (was $code)" [ "$code" = 1 ]
+  check "spool directory not writable: clear message" \
+    grep -q "Cannot create or lock spool lock file .*lockspool/.export_.lock: permission denied. The user running the client needs write access to spool.directory" "$D/once.log"
+  chmod 700 "$D/lockspool"
+  touch "$D/lockspool/.export_.lock"; chmod 400 "$D/lockspool/.export_.lock"
+  code="$(run_db)"
+  check "read-only lock file: exit 1 (was $code)" [ "$code" = 1 ]
+  check "read-only lock file: clear message" grep -q "Cannot create or lock spool lock file .*: permission denied" "$D/once.log"
+  rm -f "$D/lockspool/.export_.lock"; mkdir "$D/lockspool/.export_.lock"
+  code="$(run_db)"
+  check "lock file path is a directory: exit 1 (was $code)" [ "$code" = 1 ]
+  check "lock file path is a directory: clear message" grep -q "Cannot create or lock spool lock file .*: it is a directory" "$D/once.log"
+  rmdir "$D/lockspool/.export_.lock"
+  reset_table >/dev/null
+  code="$(run_db)"
+  check "new lock file created with mode 600 (exit $code)" [ "$(stat -c %a "$D/lockspool/.export_.lock")" = 600 ]
+  rm -rf "$D/lockspool"
+fi
+
 
 echo "Value types"
 # BIT(n) as bits (BIT(1) boolean), time zones kept, local times not shifted in a

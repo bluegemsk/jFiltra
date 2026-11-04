@@ -37,7 +37,7 @@ Tested with:
 | PostgreSQL 17.6      | `postgresql-42.7.8.jar`        | all smoke checks pass, Java 8 and 21 |
 | MariaDB 11.4.13      | `mariadb-java-client-3.5.6.jar`| all smoke checks pass, Java 8 and 21 |
 | MariaDB 11.4.13      | `mysql-connector-j-9.4.0.jar`  | all smoke checks pass, Java 8 and 21 |
-| MySQL 8.4.7          | `mysql-connector-j-9.4.0.jar`  | all smoke checks of 1.1.0 pass, Java 8 and 21 (1.1.1 and 1.1.2 not run on MySQL itself) |
+| MySQL 8.4.7          | `mysql-connector-j-9.4.0.jar`  | all smoke checks of 1.1.0 pass, Java 8 and 21; 1.1.1 to 1.1.3 only in CI (MySQL 8.4, Java 8) |
 | Oracle               | `ojdbc8` / `ojdbc11`           | **not tested yet** (no Oracle database was available); the Oracle examples below follow Oracle's documented SQL |
 
 ## Setup
@@ -82,7 +82,7 @@ dbclient/
 | `db.user` | No | Database user |
 | `db.password` | No | Database password |
 | `db.fetch.size` | No | Rows the driver fetches at a time (default `1000`; `0` = the driver's default). Keeps large results out of memory, see [How a cycle works](#how-a-cycle-works) |
-| `db.query.timeout.seconds` | No | Longest time for each statement (select and post-transfer SQL), e.g. while waiting for a lock (default `0` = no limit). A statement that takes longer fails, and the cycle is rolled back. When a cancelled select is logged, the log adds `probably db.query.timeout.seconds=N was reached` (PostgreSQL itself only says `canceling statement due to user request`) |
+| `db.query.timeout.seconds` | No | Longest time for each statement (select and post-transfer SQL), e.g. while waiting for a lock (default `0` = no limit). A statement that takes longer fails, and the cycle is rolled back. When the select or the post-transfer SQL fails with a timeout (JDBC `SQLTimeoutException`, SQLState `57014` on PostgreSQL, `70100` on MySQL/MariaDB), the log adds a line `(probably db.query.timeout.seconds=N was reached)` (PostgreSQL itself only says `canceling statement due to user request`) |
 | `db.isolation` | No | Transaction isolation: `read_committed`, `repeatable_read` or `serializable`; empty = the database's default. See [Consistency](#consistency-between-select-and-post-transfer-sql) |
 | `db.password.env` | No | Name of an environment variable holding the password; used instead of `db.password`. The client doesn't start if the variable is not set |
 | `select.sql` | Yes | One `SELECT`. All its rows go into one file. No trailing semicolon |
@@ -130,9 +130,13 @@ users. Keep it at `chmod 600`, or put the password into an environment variable
 (`db.password.env`), for example with `Environment=` in a systemd unit. The log
 shows the database URL without its parameters. Passwords in a URL
 (`user:password@`, Oracle's `user/password@`, `password=...`, also brace-quoted
-values such as `password={Top;Secret}`) and the passwords
+values such as `password={Top;Secret}`; also `passwd=` and `pwd=`, as whole
+words) and the passwords
 from `db.password`, `db.password.env` and `db.url` (4 characters or longer) are
-replaced by `****` in every logged line, including database error messages.
+replaced by `****` in every logged line, including database error messages. If
+masking a message ever fails, the line shows the error class with
+`(message hidden: masking failed)` instead of the text; the client goes on as
+for any other error.
 
 ## How a cycle works
 
@@ -169,12 +173,16 @@ time, so memory use doesn't grow with the result size:
 - PostgreSQL (pgjdbc), MariaDB driver, Oracle: `db.fetch.size` is enough.
 - MySQL Connector/J reads the whole result into memory unless the URL has
   `useCursorFetch=true`, e.g. `jdbc:mysql://host:3306/db?useCursorFetch=true`.
-  The client logs a warning at start if a `jdbc:mysql:` URL doesn't have it.
+  The client logs a warning at start if a `jdbc:mysql:` URL doesn't have it
+  (`true` or `yes`).
 
 If the client runs out of memory anyway (or hits any other unexpected error), it
 logs `JFiltraDbClient stops after an unexpected error`, nothing is committed, and
 it exits with `3`. This includes drivers that report the `OutOfMemoryError` as a
-database error (Connector/J: `SQLException: Java heap space`). After such an
+database error (Connector/J: `SQLException: Java heap space`, recognised by an
+`OutOfMemoryError` as its cause or a message that is exactly `Java heap space` or
+`GC overhead limit exceeded`; an error that only quotes these words is a normal
+database error). After such an
 error the client aborts the database connection instead of closing it (a normal
 close would wait for a rollback the driver may never finish); the database rolls
 the open transaction back.
@@ -191,8 +199,12 @@ directory (e.g. `spool/.export_.lock`). If another instance holds the lock, it
 logs `Another instance is running with the same spool directory and prefix` and
 exits: `once` with `2` (nothing done, like an empty select, so the next cron run
 simply tries again), `loop` with `1`. The lock is released when the process ends,
-also after `kill -9`; the lock file itself stays and can be ignored. Use a local
-file system for the spool directory (locks on network file systems may not work).
+also after `kill -9`; the lock file itself stays (created with mode `600`) and
+can be ignored. Use a local file system for the spool directory (locks on network
+file systems may not work). If the lock file can't be created or opened (no write
+permission on the spool directory, a read-only lock file, or a directory with
+that name), the client logs `Cannot create or lock spool lock file ...` with the
+reason and exits with `1`.
 
 Leftover temporary files of a killed run (`.<prefix><timestamp>.<format>.tmp`)
 are deleted at start only while holding the lock, so a running instance's file
@@ -283,7 +295,7 @@ Notes:
 | Server unreachable or rejects the file | rolled back, unchanged | not stored | as above |
 | Server replies `File too large` | rolled back, unchanged | not stored | `once`: exit `3`; `loop`: tries again after 10 minutes |
 | Connection lost after the file was sent, before the server's reply (e.g. `socket.timeout.seconds` too short) | rolled back, unchanged | **may be stored** | as for an unreachable server; the same rows are sent again later under a new file name, so the receiver may get them twice |
-| Post-transfer SQL or commit fails | rolled back, unchanged | **stored on the server** | logs `ERROR ... WAS DELIVERED, but post.transfer.sql or the commit failed`; `once`: exit `3`; `loop`: **stops with exit `3`** |
+| Post-transfer SQL or commit fails | rolled back, unchanged | **stored on the server** | logs `ERROR ... WAS DELIVERED, but post.transfer.sql or the commit failed` (with the `db.query.timeout.seconds` line if it timed out); `once`: exit `3`; `loop`: **stops with exit `3`** |
 | Unexpected error (e.g. out of memory, also when the driver reports it as a database error) | not committed (connection aborted, the database rolls back) | not stored, or stored if it happened after the reply | logs `stops after an unexpected error`; exit `3` |
 | Another instance runs with the same spool directory and prefix | unchanged | not sent | logs `Another instance is running ...`; `once`: exit `2`; `loop`: exit `1` |
 
@@ -421,6 +433,8 @@ exit `3` when it runs out of memory without a fetch size; with Connector/J
 without `useCursorFetch=true`, the start warning and exit `3` with a 64 MB heap),
 a driver whose rollback and close never return after an out-of-memory error
 (exit `3`, connection aborted), a second instance with the same spool directory
-and prefix (refused with exit `2` / `1`, the first one finishes), a statement
-cancelled by `db.query.timeout.seconds`, passwords masked in the log (also
-brace-quoted), leftover spool files, and configuration errors.
+and prefix (refused with exit `2` / `1`, the first one finishes), lock file
+errors, a select and a post-transfer SQL cancelled by `db.query.timeout.seconds`
+(and no timeout hint for other errors), passwords masked in the log (also
+brace-quoted, and a 1,000,000-character `password={...` text in a database
+error, `once` and `loop`), leftover spool files, and configuration errors.
