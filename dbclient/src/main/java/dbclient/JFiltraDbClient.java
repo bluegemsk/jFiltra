@@ -19,6 +19,7 @@ import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.GeneralSecurityException;
@@ -51,7 +52,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraDbClient {
 
-    private static final String VERSION = "1.1.3";
+    private static final String VERSION = "1.1.4";
 
     private static final Logger logger = LogManager.getLogger(JFiltraDbClient.class);
 
@@ -339,12 +340,23 @@ public class JFiltraDbClient {
     private boolean lockSpool() {
         Path lockFile = spoolDir.resolve(lockFileName());
         try {
+            // Only a regular file: a symbolic link is not followed, and a named pipe is not
+            // opened (opening it would block until a reader comes)
+            String notRegular = notRegularFile(lockFile);
+            if (notRegular != null) {
+                logger.error("Cannot create or lock spool lock file " + lockFile.toAbsolutePath() + ": it is " + notRegular
+                        + ", not a regular file. Remove it or use another file.prefix.");
+                System.exit(EXIT_CONFIG_ERROR);
+                return false; // Not reached
+            }
             if (lockFile.getFileSystem().supportedFileAttributeViews().contains("posix")) {
                 // rw------- when the file is created (an existing lock file keeps its mode)
-                lockChannel = FileChannel.open(lockFile, EnumSet.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE),
+                lockChannel = FileChannel.open(lockFile, new HashSet<OpenOption>(Arrays.asList(
+                        StandardOpenOption.CREATE, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)),
                         PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
             } else {
-                lockChannel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                lockChannel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                        LinkOption.NOFOLLOW_LINKS);
             }
             try {
                 spoolLock = lockChannel.tryLock();
@@ -367,6 +379,39 @@ public class JFiltraDbClient {
         return true;
     }
 
+    /**
+     * What the existing path is if it is not a regular file (e.g. "a symbolic link"), or
+     * null if it doesn't exist or is a regular file. Symbolic links are not followed.
+     */
+    static String notRegularFile(Path file) {
+        BasicFileAttributes attributes;
+        try {
+            attributes = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        } catch (IOException e) {
+            return null; // Doesn't exist (or can't be read): opening it reports the reason
+        }
+        if (attributes.isRegularFile()) {
+            return null;
+        } else if (attributes.isSymbolicLink()) {
+            return "a symbolic link";
+        } else if (attributes.isDirectory()) {
+            return "a directory";
+        } else if (isFifo(file)) {
+            return "a named pipe (FIFO)";
+        }
+        return "a special file";
+    }
+
+    /** True if the file is a named pipe (POSIX file systems; "unix" attribute view). */
+    private static boolean isFifo(Path file) {
+        try {
+            Object mode = Files.getAttribute(file, "unix:mode", LinkOption.NOFOLLOW_LINKS);
+            return mode instanceof Integer && (((Integer) mode) & 0170000) == 0010000;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     /** The log message when the spool lock file can't be created, opened or locked (A3). */
     static String lockErrorMessage(Path lockFile, IOException e) {
         String reason;
@@ -375,6 +420,8 @@ public class JFiltraDbClient {
         } else if (e instanceof AccessDeniedException) {
             reason = "permission denied. The user running the client needs write access to spool.directory"
                     + (Files.exists(lockFile) ? " and to this file" : "");
+        } else if (e instanceof NoSuchFileException) {
+            reason = "it does not exist or is not a regular file";
         } else {
             String m = e.getMessage();
             if (e instanceof FileSystemException && ((FileSystemException) e).getReason() != null) {
@@ -449,26 +496,29 @@ public class JFiltraDbClient {
 
     /**
      * Finds the values of password=..., passwd=... and pwd=... (any case, also with ":"
-     * and spaces around it). The keyword must be a whole word (letters and digits around
-     * it don't count; "_" and "." separate words, as in db_password=...). A value is
-     * either {brace-quoted} (SQL Server / ODBC: may contain ; and }} for }) or runs up to
-     * the next separator (&amp; ; , ) ' " or white space). A simple scan, no regular
-     * expression: works for text of any length.
+     * and spaces around it). The key may be any name that ends with one of these words,
+     * e.g. sslpassword=, trustStorePassword=, keyPassword=, db_password=,
+     * oracle.jdbc.password= (B1). A value is {brace-quoted} (SQL Server / ODBC: may contain
+     * ; and }} for }), "double-quoted" or 'single-quoted', or runs up to the next separator
+     * (&amp; ; , ) ' " or white space). A simple scan, no regular expression; each part of the
+     * text is searched for a closing brace or quote only once, so the time grows linearly
+     * with the length of the text (B2).
      *
      * @return [start, end) of each value, in order
      */
     static List<int[]> passwordValues(String s) {
         List<int[]> found = new ArrayList<>();
         int n = s.length();
+        Closer braces = new Closer(s, '}');
+        Closer doubleQuotes = new Closer(s, '"');
+        Closer singleQuotes = new Closer(s, '\'');
         int i = 0;
         while (i < n) {
             int keyword = 0;
-            if (i == 0 || !Character.isLetterOrDigit(s.charAt(i - 1))) {
-                for (String k : PASSWORD_KEYWORDS) {
-                    if (s.regionMatches(true, i, k, 0, k.length())) {
-                        keyword = k.length();
-                        break;
-                    }
+            for (String k : PASSWORD_KEYWORDS) {
+                if (s.regionMatches(true, i, k, 0, k.length())) {
+                    keyword = k.length();
+                    break;
                 }
             }
             if (keyword == 0) {
@@ -488,33 +538,83 @@ public class JFiltraDbClient {
                 j++;
             }
             int end = -1;
-            if (j < n && s.charAt(j) == '{') {
-                for (int k = j + 1; k < n; k++) {
-                    if (s.charAt(k) == '}') {
-                        if (k + 1 < n && s.charAt(k + 1) == '}') {
-                            k++; // }} stands for }
-                        } else {
-                            end = k + 1;
-                            break;
-                        }
+            int valueStart = j;
+            if (j < n) {
+                char c = s.charAt(j);
+                if (c == '{') {
+                    end = braces.end(j);
+                } else if (c == '"' || c == '\'') {
+                    end = (c == '"' ? doubleQuotes : singleQuotes).end(j);
+                    if (end < 0) {
+                        valueStart = j + 1; // No closing quote: the text after the quote
                     }
                 }
             }
             if (end < 0) {
-                // Not brace-quoted (or no closing brace): up to the next separator
-                end = j;
+                // Not quoted (or not closed): up to the next separator
+                end = valueStart;
                 while (end < n && "&;,)'\"".indexOf(s.charAt(end)) < 0 && !isRegexSpace(s.charAt(end))) {
                     end++;
                 }
             }
-            if (end > j) {
-                found.add(new int[] {j, end});
+            if (end > valueStart) {
+                found.add(new int[] {valueStart, end});
                 i = end;
             } else {
                 i = j;
             }
         }
         return found;
+    }
+
+    /**
+     * Finds the end of a value quoted with braces ("}}" stands for "}") or quotes, for
+     * openings at increasing positions. Remembers the last result: a later opening before
+     * the closing found (or any later opening when there is none) has the same result,
+     * so no part of the text is searched twice (B2).
+     */
+    private static final class Closer {
+        private final String s;
+        private final char close;
+        private int searchedFrom = Integer.MAX_VALUE; // Opening position of the last search
+        private int closeStart;                       // Where the closing found starts
+        private int end;                              // Its end (exclusive), -1 if none
+
+        Closer(String s, char close) {
+            this.s = s;
+            this.close = close;
+        }
+
+        /** The end (exclusive) of the value opened at {@code open}, or -1 if it isn't closed. */
+        int end(int open) {
+            if (open >= searchedFrom && (end < 0 || open < closeStart)) {
+                return end;
+            }
+            searchedFrom = open;
+            int n = s.length();
+            int k = open + 1;
+            while (k < n) {
+                if (s.charAt(k) != close) {
+                    k++;
+                    continue;
+                }
+                int run = k + 1;
+                if (close == '}') {
+                    while (run < n && s.charAt(run) == '}') {
+                        run++;
+                    }
+                    if ((run - k) % 2 == 0) {
+                        k = run; // Only }} pairs: part of the value
+                        continue;
+                    }
+                }
+                closeStart = k;
+                end = run;
+                return end;
+            }
+            end = -1;
+            return end;
+        }
     }
 
     /** The characters of \\s in a regular expression. */
@@ -537,6 +637,10 @@ public class JFiltraDbClient {
             if (value.length() > 2 && value.startsWith("{") && value.endsWith("}")) {
                 // Also the password itself, without the braces
                 found.add(value.substring(1, value.length() - 1).replace("}}", "}"));
+            } else if (value.length() > 2 && (value.startsWith("\"") && value.endsWith("\"")
+                    || value.startsWith("'") && value.endsWith("'"))) {
+                // Also the password itself, without the quotes
+                found.add(value.substring(1, value.length() - 1));
             }
         }
         return found;

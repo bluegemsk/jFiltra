@@ -404,11 +404,15 @@ check "file deleted once the directory is writable" wait_for 20 [ ! -e "$WORK/sr
 check "still appended only once" cmp -s "$WORK/received/parallel/log.txt" <(echo "line")
 
 echo "Server down"
+LINES_BEFORE="$(wc -l < "$CLIENT_LOG" | tr -d ' ')"
 kill "${PIDS[0]}" 2>/dev/null
 wait "${PIDS[0]}" 2>/dev/null
 PIDS[0]=""
 echo "while the server is down" > "$WORK/src1/later.txt"
-check "unreachable server reported in one line" wait_for 10 grep -q "Could not send later.txt: server not reachable" "$CLIENT_LOG"
+# The client may still be retrying normal.txt from the step before (waits up to 16 s)
+# and then tries it first: accept the line for either file
+check "unreachable server reported in one line" \
+  wait_for 40 sh -c "tail -n +$((LINES_BEFORE + 1)) '$CLIENT_LOG' | grep -Eq 'Could not send (later|normal)\.txt: server not reachable'"
 check "client waits before trying the server again" grep -q "Will try the server again in" "$CLIENT_LOG"
 check "no stack traces in the client log" [ "$(grep -c '^[[:space:]]*at ' "$CLIENT_LOG")" -eq 0 ]
 check "file kept while the server is down" [ -f "$WORK/src1/later.txt" ]

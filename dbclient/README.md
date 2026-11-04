@@ -37,7 +37,7 @@ Tested with:
 | PostgreSQL 17.6      | `postgresql-42.7.8.jar`        | all smoke checks pass, Java 8 and 21 |
 | MariaDB 11.4.13      | `mariadb-java-client-3.5.6.jar`| all smoke checks pass, Java 8 and 21 |
 | MariaDB 11.4.13      | `mysql-connector-j-9.4.0.jar`  | all smoke checks pass, Java 8 and 21 |
-| MySQL 8.4.7          | `mysql-connector-j-9.4.0.jar`  | all smoke checks of 1.1.0 pass, Java 8 and 21; 1.1.1 to 1.1.3 only in CI (MySQL 8.4, Java 8) |
+| MySQL 8.4.7          | `mysql-connector-j-9.4.0.jar`  | all smoke checks of 1.1.0 pass, Java 8 and 21; 1.1.1 to 1.1.4 only in CI (MySQL 8.4, Java 8) |
 | Oracle               | `ojdbc8` / `ojdbc11`           | **not tested yet** (no Oracle database was available); the Oracle examples below follow Oracle's documented SQL |
 
 ## Setup
@@ -129,9 +129,12 @@ database password. The client logs a warning if the file is readable by all
 users. Keep it at `chmod 600`, or put the password into an environment variable
 (`db.password.env`), for example with `Environment=` in a systemd unit. The log
 shows the database URL without its parameters. Passwords in a URL
-(`user:password@`, Oracle's `user/password@`, `password=...`, also brace-quoted
-values such as `password={Top;Secret}`; also `passwd=` and `pwd=`, as whole
-words) and the passwords
+(`user:password@`, Oracle's `user/password@`, and the value of every parameter
+whose name ends with `password`, `passwd` or `pwd`, in any case, with `=` or `:`,
+e.g. `password=`, `sslpassword=`, `trustStorePassword=`, `keyStorePassword=`,
+`trustCertificateKeyStorePassword=`, `keyPassword=`, `db_password=`, `PWD=`;
+also brace-quoted values such as `password={Top;Secret}` and quoted values such
+as `password="a secret"` or `password='a secret'`) and the passwords
 from `db.password`, `db.password.env` and `db.url` (4 characters or longer) are
 replaced by `****` in every logged line, including database error messages. If
 masking a message ever fails, the line shows the error class with
@@ -202,9 +205,10 @@ simply tries again), `loop` with `1`. The lock is released when the process ends
 also after `kill -9`; the lock file itself stays (created with mode `600`) and
 can be ignored. Use a local file system for the spool directory (locks on network
 file systems may not work). If the lock file can't be created or opened (no write
-permission on the spool directory, a read-only lock file, or a directory with
-that name), the client logs `Cannot create or lock spool lock file ...` with the
-reason and exits with `1`.
+permission on the spool directory or a read-only lock file), or the path exists
+but is not a regular file (a directory, a symbolic link, a named pipe or another
+special file; symbolic links are not followed), the client logs
+`Cannot create or lock spool lock file ...` with the reason and exits with `1`.
 
 Leftover temporary files of a killed run (`.<prefix><timestamp>.<format>.tmp`)
 are deleted at start only while holding the lock, so a running instance's file
@@ -434,7 +438,8 @@ without `useCursorFetch=true`, the start warning and exit `3` with a 64 MB heap)
 a driver whose rollback and close never return after an out-of-memory error
 (exit `3`, connection aborted), a second instance with the same spool directory
 and prefix (refused with exit `2` / `1`, the first one finishes), lock file
-errors, a select and a post-transfer SQL cancelled by `db.query.timeout.seconds`
+errors (also a symbolic link and a named pipe in its place), a select and a post-transfer SQL cancelled by `db.query.timeout.seconds`
 (and no timeout hint for other errors), passwords masked in the log (also
-brace-quoted, and a 1,000,000-character `password={...` text in a database
+brace-quoted and quoted, parameters such as `sslpassword=` and
+`trustCertificateKeyStorePassword=`, and a 1,000,000-character `password={...` text in a database
 error, `once` and `loop`), leftover spool files, and configuration errors.

@@ -124,8 +124,36 @@ public class DbFormatTest {
                 broken.getClass().getName() + ": (message hidden: masking failed)");
         eq(JFiltraDbClient.safe(new java.sql.SQLException("pwd=abcd; user abcd"), java.util.Arrays.asList("abcd")),
                 "java.sql.SQLException: pwd=****; user ****");
-        // Keywords only as whole words (A1)
-        eq(JFiltraDbClient.mask("mypwd=abc;oldpassword=abc;passwords=abc"), "mypwd=abc;oldpassword=abc;passwords=abc");
+        // Any key that ends with password, passwd or pwd (B1)
+        for (String key : new String[] {"sslpassword", "trustStorePassword", "keyStorePassword",
+                "trustCertificateKeyStorePassword", "clientCertificateKeyStorePassword", "keyPassword",
+                "db_password", "oracle.jdbc.password", "SSLPASSWORD", "mypwd", "oldpassword", "dbpasswd", "PWD"}) {
+            eq(JFiltraDbClient.mask("No suitable driver found for jdbc:x://h/db?user=a&" + key + "=Sec9ret&ssl=1"),
+                    "No suitable driver found for jdbc:x://h/db?user=a&" + key + "=****&ssl=1");
+            eq(JFiltraDbClient.urlPasswords("jdbc:x://h/db?user=a&" + key + "=Sec9ret&ssl=1").toString(), "[Sec9ret]");
+        }
+        eq(JFiltraDbClient.mask("passwords=abc;pwdx=abc;password_file=abc"), "passwords=abc;pwdx=abc;password_file=abc");
+        // Quoted values (observation)
+        eq(JFiltraDbClient.mask("password=\"quoted secret\" x"), "password=**** x");
+        eq(JFiltraDbClient.mask("password='quoted secret' x"), "password=**** x");
+        eq(JFiltraDbClient.mask("password=\"unclosed secret"), "password=\"**** secret");
+        eq(JFiltraDbClient.mask("password='' x"), "password=**** x");
+        eq(JFiltraDbClient.urlPasswords("jdbc:x://h;password='a b';db=x").toString(), "['a b', a b]");
+        // Linear time for many unclosed braces (B2)
+        StringBuilder many = new StringBuilder();
+        for (int k = 0; k < 100000; k++) {
+            many.append("password={ ");
+        }
+        long t0 = System.nanoTime();
+        String maskedMany = JFiltraDbClient.mask(many.toString());
+        long ms = (System.nanoTime() - t0) / 1000000;
+        System.out.println("100,000 unclosed password={ masked in " + ms + " ms");
+        eq(String.valueOf(ms < 1000), "true");
+        eq(maskedMany.substring(0, 22), "password=**** password");
+        eq(maskedMany.length() + "", String.valueOf(100000 * "password=**** ".length()));
+        eq(JFiltraDbClient.mask("a password={x b password={y} c"), "a password=**** c");
+        eq(JFiltraDbClient.mask("password={x}} pwd={y}"), "password=****");
+        eq(JFiltraDbClient.mask("password={x}}} pwd={y}"), "password=**** pwd=****");
         eq(JFiltraDbClient.mask("db.password=abc db_pwd=abc (passwd:abc)"), "db.password=**** db_pwd=**** (passwd:****)");
         eq(JFiltraDbClient.mask("password=  "), "password=  ");
         eq(JFiltraDbClient.mask("password={}"), "password=****");
@@ -151,6 +179,9 @@ public class DbFormatTest {
         eq(JFiltraDbClient.lockErrorMessage(lock, new java.nio.file.AccessDeniedException(lock.toString())),
                 "Cannot create or lock spool lock file " + lock.toAbsolutePath()
                 + ": permission denied. The user running the client needs write access to spool.directory.");
+        eq(JFiltraDbClient.lockErrorMessage(lock, new java.nio.file.NoSuchFileException(lock.toString())),
+                "Cannot create or lock spool lock file " + lock.toAbsolutePath()
+                + ": it does not exist or is not a regular file.");
         // Leftover spool files of this prefix only (N2)
         eq(String.valueOf(JFiltraDbClient.isSpoolFileName(".export_20261028-193005-123.csv.tmp", "export_")), "true");
         eq(String.valueOf(JFiltraDbClient.isSpoolFileName(".export_a20261028-193005-123.csv.tmp", "export_")), "false");

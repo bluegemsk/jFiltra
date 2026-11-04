@@ -445,6 +445,30 @@ if [ "$(id -u)" != 0 ]; then
   check "lock file path is a directory: exit 1 (was $code)" [ "$code" = 1 ]
   check "lock file path is a directory: clear message" grep -q "Cannot create or lock spool lock file .*: it is a directory" "$D/once.log"
   rmdir "$D/lockspool/.export_.lock"
+  # Not a regular file: refused before it is opened, a symbolic link is not followed
+  # and a named pipe doesn't block the start (observations 1.1.3)
+  run_db_limited() {
+    (cd "$D" && timeout 60 "$JAVA" $DB_JAVA_OPTS -Dlog4j2.configurationFile="$D/config/log4j2.properties" -cp "lib/*" \
+        dbclient.JFiltraDbClient config/dbclient.properties > once.log 2>&1)
+    echo $?
+  }
+  echo "keep" > "$D/lockspool/target"; ln -s target "$D/lockspool/.export_.lock"
+  code="$(run_db_limited)"
+  check "lock file path is a symbolic link: exit 1 (was $code)" [ "$code" = 1 ]
+  check "lock file path is a symbolic link: clear message" \
+    grep -q "Cannot create or lock spool lock file .*: it is a symbolic link, not a regular file" "$D/once.log"
+  check "lock file path is a symbolic link: target unchanged" [ "$(cat "$D/lockspool/target")" = keep ]
+  rm -f "$D/lockspool/.export_.lock" "$D/lockspool/target"; ln -s missing/x "$D/lockspool/.export_.lock"
+  code="$(run_db_limited)"
+  check "lock file path is a dangling symbolic link: exit 1 (was $code)" [ "$code" = 1 ]
+  check "lock file path is a dangling symbolic link: clear message" \
+    grep -q "Cannot create or lock spool lock file .*: it is a symbolic link, not a regular file" "$D/once.log"
+  rm -f "$D/lockspool/.export_.lock"; mkfifo "$D/lockspool/.export_.lock"
+  code="$(run_db_limited)"
+  check "lock file path is a named pipe: exit 1 without blocking (was $code)" [ "$code" = 1 ]
+  check "lock file path is a named pipe: clear message" \
+    grep -q "Cannot create or lock spool lock file .*: it is a named pipe (FIFO), not a regular file" "$D/once.log"
+  rm -f "$D/lockspool/.export_.lock"
   reset_table >/dev/null
   code="$(run_db)"
   check "new lock file created with mode 600 (exit $code)" [ "$(stat -c %a "$D/lockspool/.export_.lock")" = 600 ]
@@ -536,13 +560,25 @@ check "hanging driver: logged as unexpected error" grep -q "stops after an unexp
 echo "Passwords not logged"
 for url in "jdbc:nosuchdb://jfuser:SECRETPW99@127.0.0.1:1/db?user=x&password=SECRETPW99" \
            "jdbc:oracle:thin:scott/SECRETPW99@//127.0.0.1:1/ORCL" \
-           "jdbc:sqlserver://127.0.0.1:1;databaseName=x;password={Top;SECRETPW99}"; do
+           "jdbc:sqlserver://127.0.0.1:1;databaseName=x;password={Top;SECRETPW99}" \
+           "jdbc:postgres://127.0.0.1:1/postgres?user=test&sslpassword=SECRETPW99" \
+           "jdbc:mysqll://127.0.0.1:1/test?trustCertificateKeyStorePassword=SECRETPW99" \
+           "jdbc:nosuchdb://127.0.0.1:1/db?clientCertificateKeyStorePassword=SECRETPW99&keyStorePassword=SECRETPW99" \
+           "jdbc:nosuchdb://127.0.0.1:1/db?trustStorePassword=SECRETPW99;keyPassword=SECRETPW99" \
+           "jdbc:nosuchdb://127.0.0.1:1/db?password=\"SECRET PW99\"&x=1"; do
   write_config csv true "" "db.url=$url"
   code="$(run_db)"
   check "${url%%SECRET*}...: exit 3 (was $code), password not in the logs" \
     [ "$code:$(cat "$DB_LOG" "$D/once.log" | grep -c SECRETPW99)" = "3:0" ]
 done
 check "masked URL logged" grep -q "jdbc:nosuchdb://jfuser:\*\*\*\*@127.0.0.1:1/db" "$DB_LOG"
+# Parameters whose names end with password are masked in the quoted URL (B1)
+check "sslpassword masked in 'No suitable driver'" \
+  grep -q "No suitable driver found for jdbc:postgres://127.0.0.1:1/postgres?user=test&sslpassword=\*\*\*\*" "$DB_LOG"
+check "trustCertificateKeyStorePassword masked in 'No suitable driver'" \
+  grep -q "No suitable driver found for jdbc:mysqll://127.0.0.1:1/test?trustCertificateKeyStorePassword=\*\*\*\*" "$DB_LOG"
+check "quoted password masked" grep -q "db?password=\*\*\*\*&x=1" "$DB_LOG"
+check "quoted password: no part of it logged" [ "$(grep -c 'PW99' "$DB_LOG")" = 0 ]
 
 echo "Spool"
 reset_table; clear_received
