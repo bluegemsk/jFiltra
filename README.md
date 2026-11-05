@@ -2,7 +2,7 @@
 
 jFiltra is a lightweight Java client/server tool for moving files from watched
 directories to a central server, reliably and with as little setup as possible.
-Current version: **1.1.4** (server, client and DB client share the version).
+Current version: **1.1.5** (server, client and DB client share the version).
 
 - The **client** polls one or more source directories. For each file it computes a
   SHA-256 hash, compresses the file with GZIP, scrambles it with AES using a

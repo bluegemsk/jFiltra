@@ -463,6 +463,15 @@ if [ "$(id -u)" != 0 ]; then
   check "lock file path is a dangling symbolic link: exit 1 (was $code)" [ "$code" = 1 ]
   check "lock file path is a dangling symbolic link: clear message" \
     grep -q "Cannot create or lock spool lock file .*: it is a symbolic link, not a regular file" "$D/once.log"
+  # spool.directory itself a dangling symbolic link (C2)
+  rm -f "$D/lockspool/.export_.lock"; ln -s missing/dir "$D/danglingspool"
+  sed -i "s|^spool.directory=.*|spool.directory=$D/danglingspool|" "$D/config/dbclient.properties"
+  code="$(run_db_limited)"
+  check "spool.directory is a dangling symbolic link: exit 1 (was $code)" [ "$code" = 1 ]
+  check "spool.directory is a dangling symbolic link: clear message" \
+    grep -q "Setting spool.directory is a symbolic link to a missing path: $D/danglingspool" "$D/once.log"
+  rm -f "$D/danglingspool"
+  sed -i "s|^spool.directory=.*|spool.directory=$D/lockspool|" "$D/config/dbclient.properties"
   rm -f "$D/lockspool/.export_.lock"; mkfifo "$D/lockspool/.export_.lock"
   code="$(run_db_limited)"
   check "lock file path is a named pipe: exit 1 without blocking (was $code)" [ "$code" = 1 ]
@@ -565,7 +574,8 @@ for url in "jdbc:nosuchdb://jfuser:SECRETPW99@127.0.0.1:1/db?user=x&password=SEC
            "jdbc:mysqll://127.0.0.1:1/test?trustCertificateKeyStorePassword=SECRETPW99" \
            "jdbc:nosuchdb://127.0.0.1:1/db?clientCertificateKeyStorePassword=SECRETPW99&keyStorePassword=SECRETPW99" \
            "jdbc:nosuchdb://127.0.0.1:1/db?trustStorePassword=SECRETPW99;keyPassword=SECRETPW99" \
-           "jdbc:nosuchdb://127.0.0.1:1/db?password=\"SECRET PW99\"&x=1"; do
+           "jdbc:nosuchdb://127.0.0.1:1/db?password=\"SECRET PW99\"&x=1" \
+           "jdbc:mysqll://address=(host=127.0.0.1)(port=1)(user=pwt)(password=Ab,SECRETPW99)/test"; do
   write_config csv true "" "db.url=$url"
   code="$(run_db)"
   check "${url%%SECRET*}...: exit 3 (was $code), password not in the logs" \
@@ -578,6 +588,9 @@ check "sslpassword masked in 'No suitable driver'" \
 check "trustCertificateKeyStorePassword masked in 'No suitable driver'" \
   grep -q "No suitable driver found for jdbc:mysqll://127.0.0.1:1/test?trustCertificateKeyStorePassword=\*\*\*\*" "$DB_LOG"
 check "quoted password masked" grep -q "db?password=\*\*\*\*&x=1" "$DB_LOG"
+# Unquoted value with a comma, up to ) (C1)
+check "comma in password fully masked in 'No suitable driver'" \
+  grep -q "No suitable driver found for jdbc:mysqll://address=(host=127.0.0.1)(port=1)(user=pwt)(password=\*\*\*\*)/test" "$DB_LOG"
 check "quoted password: no part of it logged" [ "$(grep -c 'PW99' "$DB_LOG")" = 0 ]
 
 echo "Spool"

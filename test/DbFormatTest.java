@@ -108,8 +108,8 @@ public class DbFormatTest {
         // Long brace-quoted text: no StackOverflowError (A1)
         String longText = new String(new char[1000000]).replace('\0', 'x');
         eq(JFiltraDbClient.mask("bad value: \"note password={" + longText + "}\" at 1"), "bad value: \"note password=****\" at 1");
-        eq(JFiltraDbClient.mask("bad value: \"note pwd={" + longText + "\""), "bad value: \"note pwd=****\"");
-        eq(JFiltraDbClient.mask("PWD = {" + longText + "}} ;x"), "PWD = **** ;x");
+        eq(JFiltraDbClient.mask("bad value: \"note pwd={" + longText + "\""), "bad value: \"note pwd=****"); // Unclosed: up to & ; ) (C1)
+        eq(JFiltraDbClient.mask("PWD = {" + longText + "}} ;x"), "PWD = ****;x"); // Unclosed: up to & ; ) (C1)
         eq(String.valueOf(JFiltraDbClient.urlPasswords("jdbc:x://h;password={" + longText + "}").size()), "2");
         eq(JFiltraDbClient.replaceLiteral("a" + longText + "b" + longText, longText, "*"), "a*b*");
         eq(JFiltraDbClient.replaceLiteral("abcabc", "bc", "*"), "a*a*");
@@ -136,25 +136,36 @@ public class DbFormatTest {
         // Quoted values (observation)
         eq(JFiltraDbClient.mask("password=\"quoted secret\" x"), "password=**** x");
         eq(JFiltraDbClient.mask("password='quoted secret' x"), "password=**** x");
-        eq(JFiltraDbClient.mask("password=\"unclosed secret"), "password=\"**** secret");
+        eq(JFiltraDbClient.mask("password=\"unclosed secret"), "password=\"****");
+        eq(JFiltraDbClient.mask("password=\"unclosed secret&x=1"), "password=\"****&x=1");
+        // Unquoted values run up to & ; or ) only (C1)
+        eq(JFiltraDbClient.mask("jdbc:mysql://address=(host=127.0.0.1)(port=53306)(user=pwt)(password=Ab,cd9XyZ)/test"),
+                "jdbc:mysql://address=(host=127.0.0.1)(port=53306)(user=pwt)(password=****)/test");
+        eq(JFiltraDbClient.urlPasswords("jdbc:mysql://address=(host=h)(user=pwt)(password=Ab,cd9XyZ)/test").toString(), "[Ab,cd9XyZ]");
+        for (String pw : new String[] {"Ab,cd9", "Ab'cd9", "Ab\"cd9", "Ab cd9", "Ab, 'c\" d9"}) {
+            eq(JFiltraDbClient.mask("jdbc:x://h/db?user=a&password=" + pw + "&ssl=1"), "jdbc:x://h/db?user=a&password=****&ssl=1");
+            eq(JFiltraDbClient.mask("(user=a)(password=" + pw + ")/db"), "(user=a)(password=****)/db");
+            eq(JFiltraDbClient.urlPasswords("jdbc:x://h/db?password=" + pw + "&ssl=1").toString(), "[" + pw + "]");
+        }
+        eq(JFiltraDbClient.urlPasswords("jdbc:x://h;password=Ab,c d;db=x").toString(), "[Ab,c d]");
         eq(JFiltraDbClient.mask("password='' x"), "password=**** x");
         eq(JFiltraDbClient.urlPasswords("jdbc:x://h;password='a b';db=x").toString(), "['a b', a b]");
         // Linear time for many unclosed braces (B2)
         StringBuilder many = new StringBuilder();
         for (int k = 0; k < 100000; k++) {
-            many.append("password={ ");
+            many.append("password={ ;"); // ; ends an unclosed value (C1)
         }
         long t0 = System.nanoTime();
         String maskedMany = JFiltraDbClient.mask(many.toString());
         long ms = (System.nanoTime() - t0) / 1000000;
         System.out.println("100,000 unclosed password={ masked in " + ms + " ms");
         eq(String.valueOf(ms < 1000), "true");
-        eq(maskedMany.substring(0, 22), "password=**** password");
-        eq(maskedMany.length() + "", String.valueOf(100000 * "password=**** ".length()));
+        eq(maskedMany.substring(0, 22), "password=****;password");
+        eq(maskedMany.length() + "", String.valueOf(100000 * "password=****;".length()));
         eq(JFiltraDbClient.mask("a password={x b password={y} c"), "a password=**** c");
         eq(JFiltraDbClient.mask("password={x}} pwd={y}"), "password=****");
         eq(JFiltraDbClient.mask("password={x}}} pwd={y}"), "password=**** pwd=****");
-        eq(JFiltraDbClient.mask("db.password=abc db_pwd=abc (passwd:abc)"), "db.password=**** db_pwd=**** (passwd:****)");
+        eq(JFiltraDbClient.mask("db.password=abc;db_pwd=abc&(passwd:abc)"), "db.password=****;db_pwd=****&(passwd:****)");
         eq(JFiltraDbClient.mask("password=  "), "password=  ");
         eq(JFiltraDbClient.mask("password={}"), "password=****");
         eq(JFiltraDbClient.mask("password={{inner}}}"), "password=****");

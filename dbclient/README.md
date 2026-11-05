@@ -37,7 +37,7 @@ Tested with:
 | PostgreSQL 17.6      | `postgresql-42.7.8.jar`        | all smoke checks pass, Java 8 and 21 |
 | MariaDB 11.4.13      | `mariadb-java-client-3.5.6.jar`| all smoke checks pass, Java 8 and 21 |
 | MariaDB 11.4.13      | `mysql-connector-j-9.4.0.jar`  | all smoke checks pass, Java 8 and 21 |
-| MySQL 8.4.7          | `mysql-connector-j-9.4.0.jar`  | all smoke checks of 1.1.0 pass, Java 8 and 21; 1.1.1 to 1.1.4 only in CI (MySQL 8.4, Java 8) |
+| MySQL 8.4.7          | `mysql-connector-j-9.4.0.jar`  | all smoke checks of 1.1.0 pass, Java 8 and 21; 1.1.1 to 1.1.5 only in CI (MySQL 8.4, Java 8) |
 | Oracle               | `ojdbc8` / `ojdbc11`           | **not tested yet** (no Oracle database was available); the Oracle examples below follow Oracle's documented SQL |
 
 ## Setup
@@ -134,7 +134,9 @@ whose name ends with `password`, `passwd` or `pwd`, in any case, with `=` or `:`
 e.g. `password=`, `sslpassword=`, `trustStorePassword=`, `keyStorePassword=`,
 `trustCertificateKeyStorePassword=`, `keyPassword=`, `db_password=`, `PWD=`;
 also brace-quoted values such as `password={Top;Secret}` and quoted values such
-as `password="a secret"` or `password='a secret'`) and the passwords
+as `password="a secret"` or `password='a secret'`; an unquoted value runs up
+to the next `&`, `;` or `)`, so `,`, quotes and spaces in it are masked too, e.g.
+`(password=Ab,cd9XyZ)` in a MySQL `address=` URL) and the passwords
 from `db.password`, `db.password.env` and `db.url` (4 characters or longer) are
 replaced by `****` in every logged line, including database error messages. If
 masking a message ever fails, the line shows the error class with
@@ -438,8 +440,8 @@ without `useCursorFetch=true`, the start warning and exit `3` with a 64 MB heap)
 a driver whose rollback and close never return after an out-of-memory error
 (exit `3`, connection aborted), a second instance with the same spool directory
 and prefix (refused with exit `2` / `1`, the first one finishes), lock file
-errors (also a symbolic link and a named pipe in its place), a select and a post-transfer SQL cancelled by `db.query.timeout.seconds`
+errors (also a symbolic link and a named pipe in its place), a `spool.directory` that is a dangling symbolic link, a select and a post-transfer SQL cancelled by `db.query.timeout.seconds`
 (and no timeout hint for other errors), passwords masked in the log (also
 brace-quoted and quoted, parameters such as `sslpassword=` and
-`trustCertificateKeyStorePassword=`, and a 1,000,000-character `password={...` text in a database
+`trustCertificateKeyStorePassword=`, a comma in an unquoted password, and a 1,000,000-character `password={...` text in a database
 error, `once` and `loop`), leftover spool files, and configuration errors.

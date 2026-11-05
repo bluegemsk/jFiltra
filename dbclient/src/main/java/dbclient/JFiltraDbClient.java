@@ -52,7 +52,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraDbClient {
 
-    private static final String VERSION = "1.1.4";
+    private static final String VERSION = "1.1.5";
 
     private static final Logger logger = LogManager.getLogger(JFiltraDbClient.class);
 
@@ -192,6 +192,10 @@ public class JFiltraDbClient {
             spoolDir = Paths.get(config.getProperty("spool.directory", "spool").trim());
             if (Files.exists(spoolDir) && !Files.isDirectory(spoolDir)) {
                 throw new IllegalArgumentException("Setting spool.directory is not a directory: " + spoolDir.toAbsolutePath());
+            }
+            if (Files.isSymbolicLink(spoolDir) && !Files.exists(spoolDir)) {
+                throw new IllegalArgumentException("Setting spool.directory is a symbolic link to a missing path: "
+                        + spoolDir.toAbsolutePath());
             }
             Files.createDirectories(spoolDir);
             if (!lockSpool()) {
@@ -500,7 +504,7 @@ public class JFiltraDbClient {
      * e.g. sslpassword=, trustStorePassword=, keyPassword=, db_password=,
      * oracle.jdbc.password= (B1). A value is {brace-quoted} (SQL Server / ODBC: may contain
      * ; and }} for }), "double-quoted" or 'single-quoted', or runs up to the next separator
-     * (&amp; ; , ) ' " or white space). A simple scan, no regular expression; each part of the
+     * (&amp; ; or ), C1: , ' " and spaces belong to the value). A simple scan, no regular expression; each part of the
      * text is searched for a closing brace or quote only once, so the time grows linearly
      * with the length of the text (B2).
      *
@@ -551,9 +555,10 @@ public class JFiltraDbClient {
                 }
             }
             if (end < 0) {
-                // Not quoted (or not closed): up to the next separator
+                // Not quoted (or not closed): up to the next &, ; or ) (C1: , ' " and
+                // spaces are normal password characters in URL parameters)
                 end = valueStart;
-                while (end < n && "&;,)'\"".indexOf(s.charAt(end)) < 0 && !isRegexSpace(s.charAt(end))) {
+                while (end < n && "&;)".indexOf(s.charAt(end)) < 0) {
                     end++;
                 }
             }
