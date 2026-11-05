@@ -41,7 +41,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraClient {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.1.6";
+    private static final String VERSION = "1.1.7";
     
     // Initialize logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraClient.class);
@@ -128,6 +128,9 @@ public class JFiltraClient {
     
     // Source directories reported as missing, so the warning is logged only once
     private final Set<String> missingDirs = new HashSet<>();
+
+    // Source directories where a file named "sent" was skipped (after.send=move), logged once
+    private final Set<String> reservedSentWarned = new HashSet<>();
     
     /**
      * When to retry a file the server rejected, and the size and modification time it had then.
@@ -457,7 +460,9 @@ public class JFiltraClient {
 
     /**
      * Lists the files in a directory that may be sent: regular files (no symbolic links)
-     * that match filemask and no ignore pattern.
+     * that match filemask and no ignore pattern. With after.send=move, a file whose name
+     * is {@code sent} (any letter case) is skipped: that name is reserved for the archive
+     * directory.
      *
      * @param dir The source directory
      * @return The files with their size and modification time
@@ -470,6 +475,7 @@ public class JFiltraClient {
         List<Path> files = new ArrayList<>();
         try (Stream<Path> entries = Files.list(dir)) {
             entries.filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
+                   .filter(file -> !isReservedSentName(file, dir))
                    .filter(file -> !isIgnored(file))
                    .filter(this::matchesFileMask)
                    .forEach(files::add);
@@ -665,6 +671,23 @@ public class JFiltraClient {
     }
 
     /**
+     * With after.send=move, a regular file named {@code sent} (any letter case) must not
+     * be sent: that name is reserved for the archive directory under the source. Logs a
+     * warning once per source directory.
+     */
+    private boolean isReservedSentName(Path file, Path dir) {
+        if (!moveToSent || !file.getFileName().toString().equalsIgnoreCase("sent")) {
+            return false;
+        }
+        if (reservedSentWarned.add(dir.toString())) {
+            logger.warn("Skipping file named \"" + file.getFileName()
+                    + "\" (the name is reserved for the sent/ directory when after.send=move); "
+                    + "rename or remove it: " + dir);
+        }
+        return true;
+    }
+
+    /**
      * Checks whether a file matches one of the ignore patterns.
      * 
      * @param file The file to check
@@ -829,9 +852,10 @@ public class JFiltraClient {
 
     /**
      * Deletes a file the server has stored, or with after.send=move moves it to the
-     * sent/ subdirectory of its source directory (an older file of the same name there
-     * is replaced). If that fails, the file is remembered as delivered, so only the
-     * delete/move is retried later (with growing delays), never the transfer.
+     * sent/ subdirectory of its source directory (a directory or a symbolic link to one;
+     * an older file of the same name there is replaced). If that fails, the file is
+     * remembered as delivered, so only the delete/move is retried later (with growing
+     * delays), never the transfer.
      *
      * @param filePath The delivered file
      * @param snapshot The file's size and modification time when it was sent
@@ -843,14 +867,27 @@ public class JFiltraClient {
             boolean retried = deliveredFiles.containsKey(filePath);
             if (moveToSent) {
                 Path sentDir = filePath.getParent().resolve("sent");
-                if (Files.exists(sentDir, LinkOption.NOFOLLOW_LINKS)
+                // A symbolic link to a directory is allowed (e.g. archive on another disk).
+                // Check the link itself first so a dangling or non-dir link gets a clear message.
+                if (Files.isSymbolicLink(sentDir)) {
+                    if (!Files.exists(sentDir)) {
+                        throw new IOException(sentDir + " is a symbolic link to a missing path");
+                    }
+                    if (!Files.isDirectory(sentDir)) {
+                        throw new IOException(sentDir + " is a symbolic link that is not a directory");
+                    }
+                } else if (Files.exists(sentDir, LinkOption.NOFOLLOW_LINKS)
                         && !Files.isDirectory(sentDir, LinkOption.NOFOLLOW_LINKS)) {
                     throw new IOException(sentDir + " exists and is not a directory");
                 }
                 if (!Files.exists(filePath, LinkOption.NOFOLLOW_LINKS)) {
                     throw new NoSuchFileException(filePath.toString());
                 }
-                Files.createDirectories(sentDir);
+                // createDirectories only when sent/ is missing; leave an existing dir or
+                // symlink-to-dir alone
+                if (!Files.isDirectory(sentDir)) {
+                    Files.createDirectories(sentDir);
+                }
                 Path target = sentDir.resolve(fileName);
                 try {
                     Files.move(filePath, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);

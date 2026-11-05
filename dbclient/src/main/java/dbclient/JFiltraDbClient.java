@@ -52,7 +52,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraDbClient {
 
-    private static final String VERSION = "1.1.6";
+    private static final String VERSION = "1.1.7";
 
     private static final Logger logger = LogManager.getLogger(JFiltraDbClient.class);
 
@@ -503,10 +503,14 @@ public class JFiltraDbClient {
      * and spaces around it). The key may be any name that ends with one of these words,
      * e.g. sslpassword=, trustStorePassword=, keyPassword=, db_password=,
      * oracle.jdbc.password= (B1). A value is {brace-quoted} (SQL Server / ODBC: may contain
-     * ; and }} for }), "double-quoted" or 'single-quoted', or runs up to the next separator
-     * (&amp; ; or ), C1: , ' " and spaces belong to the value). A simple scan, no regular expression; each part of the
-     * text is searched for a closing brace or quote only once, so the time grows linearly
-     * with the length of the text (B2).
+     * ; and }} for }), "double-quoted" or 'single-quoted' only when the closing quote is
+     * at the end or followed by &amp;, whitespace, or ) in a (key=...) form (C1b: otherwise
+     * e.g. "Wq8"Er5 is masked as one unquoted value), or runs up to the next &amp; or
+     * whitespace, and also up to ) when the character before the keyword is ( (MySQL
+     * address=; C1b/C1c: ; is part of the value, and spaces end it so multi-line errors
+     * stay readable). A simple scan, no regular expression; each part of the text is
+     * searched for a closing brace or quote only once, so the time grows linearly with
+     * the length of the text (B2).
      *
      * @return [start, end) of each value, in order
      */
@@ -529,6 +533,8 @@ public class JFiltraDbClient {
                 i++;
                 continue;
             }
+            // MySQL address=(...)(password=...): ) ends the value only in this form (C1b)
+            boolean parenForm = i > 0 && s.charAt(i - 1) == '(';
             int j = i + keyword;
             while (j < n && isRegexSpace(s.charAt(j))) {
                 j++;
@@ -548,17 +554,29 @@ public class JFiltraDbClient {
                 if (c == '{') {
                     end = braces.end(j);
                 } else if (c == '"' || c == '\'') {
-                    end = (c == '"' ? doubleQuotes : singleQuotes).end(j);
-                    if (end < 0) {
+                    int closed = (c == '"' ? doubleQuotes : singleQuotes).end(j);
+                    if (closed >= 0) {
+                        boolean okAfter = closed >= n
+                                || s.charAt(closed) == '&'
+                                || isRegexSpace(s.charAt(closed))
+                                || (parenForm && s.charAt(closed) == ')');
+                        if (okAfter) {
+                            end = closed; // Properly quoted value (includes the quotes)
+                        }
+                        // else: closed quote followed by more password text - unquoted from "
+                    } else {
                         valueStart = j + 1; // No closing quote: the text after the quote
                     }
                 }
             }
             if (end < 0) {
-                // Not quoted (or not closed): up to the next &, ; or ) (C1: , ' " and
-                // spaces are normal password characters in URL parameters)
+                // Not quoted (or not a clean quote): up to & or whitespace; also ) in (key=)
                 end = valueStart;
-                while (end < n && "&;)".indexOf(s.charAt(end)) < 0) {
+                while (end < n) {
+                    char ch = s.charAt(end);
+                    if (ch == '&' || isRegexSpace(ch) || (parenForm && ch == ')')) {
+                        break;
+                    }
                     end++;
                 }
             }

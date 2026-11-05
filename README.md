@@ -2,7 +2,7 @@
 
 jFiltra is a lightweight Java client/server tool for moving files from watched
 directories to a central server, reliably and with as little setup as possible.
-Current version: **1.1.6** (server, client and DB client share the version).
+Current version: **1.1.7** (server, client and DB client share the version).
 
 - The **client** polls one or more source directories. For each file it computes a
   SHA-256 hash, compresses the file with GZIP, scrambles it with AES using a
@@ -381,11 +381,14 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
 - The client deletes a file only after the server replies with success. In all
   other cases the file stays where it is and is retried (see [Retries](#retries)).
 - With `after.send=move` the file is moved instead of deleted, to `sent/` inside
-  its source directory (created when needed; the name is fixed). A file of the same
-  name already in `sent/` is replaced. Because subdirectories are not scanned,
-  files in `sent/` are never sent again. Nothing cleans up `sent/`; remove old files
-  there yourself (for example with a cron job). If `sent` exists but is not a
-  directory, the file is handled like one that can't be deleted (see below).
+  its source directory (created when needed; the name is fixed). `sent` may be a
+  directory or a symbolic link to a directory (for example on another disk). A file
+  of the same name already in `sent/` is replaced. Because subdirectories are not
+  scanned, files in `sent/` are never sent again. Nothing cleans up `sent/`; remove
+  old files there yourself (for example with a cron job). A regular file named
+  `sent` (any letter case) is never sent: that name is reserved for the archive
+  folder; rename or remove it. If `sent` exists but is not a directory (and not a
+  link to one), the file is handled like one that can't be deleted (see below).
 - When the server rejects a file, the client logs the reason, for example
   `Server rejected file report.pdf: ERROR: File already exists`. The server log
   has the details. A wrong key is reported as `ERROR: Decryption failed`.

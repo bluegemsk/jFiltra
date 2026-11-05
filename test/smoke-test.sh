@@ -272,7 +272,8 @@ run_once() {
   # $1: file.order; prints the exit code
   sed -i '/^file.order=/d' "$C5/config/client.properties"
   [ -n "$1" ] && echo "file.order=$1" >> "$C5/config/client.properties"
-  (cd "$C5" && "$JAVA" -cp "lib/*" client.JFiltraClient config/client.properties > once.log 2>&1)
+  # Same Log4j config as the loop clients so WARN lines (e.g. reserved "sent") are kept
+  (cd "$C5" && "$JAVA" -Dlog4j2.configurationFile="$C5/config/log4j2.properties"       -cp "lib/*" client.JFiltraClient config/client.properties > once.log 2>&1)
   echo $?
 }
 # a: largest and newest, b: smallest, c: oldest
@@ -327,12 +328,36 @@ check "move: files in sent/ not sent again (empty outbox exits 2)" [ "$code" = 2
 rm -f "$WORK/received/client5/m1.txt"; echo "newer content" > "$WORK/src5/m1.txt"
 code="$(run_once name)"
 check "move: same name in sent/ replaced" [ "$code" = 0 ] && cmp -s "$WORK/src5/sent/m1.txt" <(echo "newer content")
+# D1: a file named sent is never sent (reserved for the archive folder)
+rm -rf "$WORK/src5" "$WORK/received/client5/sent" && mkdir -p "$WORK/src5"
+echo "blocker" > "$WORK/src5/sent"
+echo "other" > "$WORK/src5/other.txt"
+code="$(run_once name)"
+check "move: file named sent is not delivered" [ -f "$WORK/src5/sent" -a ! -e "$WORK/received/client5/sent" ]
+check "move: reserved sent name is logged once" grep -q 'Skipping file named "sent".*reserved for the sent/ directory' "$C5/once.log" "$C5/logs/client_jfiltra.log"
+# other.txt may be delivered but cannot be moved while sent (the file) blocks sent/
+check "move: other file stays while sent file blocks the archive dir" [ -f "$WORK/src5/other.txt" ]
+check "move: blocking sent file names the problem for the other file" \
+  grep -q "other.txt was delivered but can't be moved to sent/.*is not a directory" "$C5/once.log" "$C5/logs/client_jfiltra.log"
+
+# Still: with filemask, only m2 is a candidate; sent file blocks the move
 rm -rf "$WORK/src5" && mkdir -p "$WORK/src5" && echo x > "$WORK/src5/sent" && echo y > "$WORK/src5/m2.txt"
 echo "filemask=m*.txt" >> "$C5/config/client.properties"
 code="$(run_once name)"
 check "move: 'sent' file in the way keeps the file and names the problem" \
   [ -f "$WORK/src5/m2.txt" ] && grep -q "m2.txt was delivered but can't be moved to sent/.*is not a directory" "$C5/once.log" "$C5/logs/client_jfiltra.log"
-sed -i '/^filemask=/d; s/^after.send=.*/after.send=archive/' "$C5/config/client.properties"
+sed -i '/^filemask=/d' "$C5/config/client.properties"
+
+# D2: sent as a symbolic link to a directory
+rm -rf "$WORK/src5" "$WORK/archive5" && mkdir -p "$WORK/src5" "$WORK/archive5"
+ln -s "$WORK/archive5" "$WORK/src5/sent"
+echo "linked content" > "$WORK/src5/m3.txt"
+code="$(run_once name)"
+check "move: symlink sent/ to a directory: exit 0 and source cleared" [ "$code" = 0 -a ! -e "$WORK/src5/m3.txt" ]
+check "move: file landed in the symlink target" cmp -s "$WORK/archive5/m3.txt" <(echo "linked content")
+check "move: symlink itself remains" [ -L "$WORK/src5/sent" ]
+
+sed -i 's/^after.send=.*/after.send=archive/' "$C5/config/client.properties"
 code="$(run_once name)"
 check "invalid after.send exits with 1" [ "$code" = 1 ]
 check "invalid after.send message names the values" grep -q "after.send must be delete or move, but is: archive" "$C5/once.log"
