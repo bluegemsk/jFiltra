@@ -41,7 +41,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraClient {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.1.5";
+    private static final String VERSION = "1.1.6";
     
     // Initialize logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraClient.class);
@@ -62,6 +62,7 @@ public class JFiltraClient {
     private String fileMask;                    // File name masks of files to send
     private List<String> fileMasks;             // Parsed file masks
     private boolean runOnce;                    // run.mode=once: send one file and exit
+    private boolean moveToSent;                 // after.send=move: move sent files to <source>/sent/
     private String fileOrder;                   // file.order: time, size or name, ! reverses
     private Comparator<Candidate> fileComparator; // Order in which files are sent
     private boolean lastFileSent;               // Whether the last processFile call succeeded
@@ -224,6 +225,14 @@ public class JFiltraClient {
                         + config.getProperty("run.mode").trim());
             }
             runOnce = mode.equals("once");
+
+            // What happens to a file after the server stored it: delete (default) or move to sent/
+            String afterSend = config.getProperty("after.send", "delete").trim().toLowerCase(Locale.ROOT);
+            if (!afterSend.isEmpty() && !afterSend.equals("delete") && !afterSend.equals("move")) {
+                throw new IllegalArgumentException("Setting after.send must be delete or move, but is: "
+                        + config.getProperty("after.send").trim());
+            }
+            moveToSent = afterSend.equals("move");
 
             // Order in which files are sent (default time: oldest first)
             fileOrder = config.getProperty("file.order", "time").trim();
@@ -707,13 +716,13 @@ public class JFiltraClient {
                 }
             }
             
-            // Delivered before but not deleted: only retry the delete, never send it again
+            // Delivered before but not removed: only retry the delete/move, never send it again
             String delivered = deliveredFiles.get(file);
             if (delivered != null) {
                 if (!delivered.equals(snapshot)) {
                     deliveredFiles.remove(file); // Changed since: the new content is sent
                 } else {
-                    deleteDelivered(file, snapshot);
+                    finishDelivered(file, snapshot);
                     return;
                 }
             }
@@ -790,14 +799,14 @@ public class JFiltraClient {
                 String size = snapshot.substring(0, snapshot.indexOf(':'));
                 logger.info(String.format("File sent: %s (%s bytes, %.2f s, SHA-256 %s)", fileName, size, seconds, fileHash));
                 
-                // Delete original file after successful transfer, unless it changed while
-                // being sent - deleting it then would lose the new content
+                // Delete (or move to sent/) the original file after successful transfer, unless it
+                // changed while being sent - removing it then would lose the new content
                 if (!snapshot.equals(fileSnapshot(filePath))) {
-                    logger.warn("File changed while being sent and was not deleted: " + fileName);
+                    logger.warn("File changed while being sent and was not " + (moveToSent ? "moved" : "deleted") + ": " + fileName);
                     return;
                 }
                 retries.remove(filePath);
-                lastFileSent = deleteDelivered(filePath, snapshot);
+                lastFileSent = finishDelivered(filePath, snapshot);
             } else if (PERMANENT_REJECTIONS.contains(response)) {
                 lastPermanentRejection = true;
                 // Don't resend a file the server will always reject; it is tried again once it changes
@@ -819,27 +828,50 @@ public class JFiltraClient {
     }
 
     /**
-     * Deletes a file the server has stored. If that fails, the file is remembered as
-     * delivered, so only the delete is retried later (with growing delays), never the transfer.
+     * Deletes a file the server has stored, or with after.send=move moves it to the
+     * sent/ subdirectory of its source directory (an older file of the same name there
+     * is replaced). If that fails, the file is remembered as delivered, so only the
+     * delete/move is retried later (with growing delays), never the transfer.
      *
      * @param filePath The delivered file
      * @param snapshot The file's size and modification time when it was sent
-     * @return true if the file was deleted
+     * @return true if the file is gone from the source directory
      */
-    private boolean deleteDelivered(Path filePath, String snapshot) {
+    private boolean finishDelivered(Path filePath, String snapshot) {
         String fileName = filePath.getFileName().toString();
         try {
-            Files.delete(filePath);
-            if (deliveredFiles.remove(filePath) != null) {
-                logger.info("Deleted delivered file: " + fileName);
+            boolean retried = deliveredFiles.containsKey(filePath);
+            if (moveToSent) {
+                Path sentDir = filePath.getParent().resolve("sent");
+                if (Files.exists(sentDir, LinkOption.NOFOLLOW_LINKS)
+                        && !Files.isDirectory(sentDir, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IOException(sentDir + " exists and is not a directory");
+                }
+                if (!Files.exists(filePath, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new NoSuchFileException(filePath.toString());
+                }
+                Files.createDirectories(sentDir);
+                Path target = sentDir.resolve(fileName);
+                try {
+                    Files.move(filePath, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException e) {
+                    Files.move(filePath, target, StandardCopyOption.REPLACE_EXISTING);
+                }
+                logger.info("Moved delivered file to sent/: " + fileName);
+            } else {
+                Files.delete(filePath);
+                if (retried) {
+                    logger.info("Deleted delivered file: " + fileName);
+                }
             }
+            deliveredFiles.remove(filePath);
             retries.remove(filePath);
             return true;
         } catch (NoSuchFileException e) {
             deliveredFiles.remove(filePath);
             return true;
         } catch (IOException e) {
-            logger.error("File " + fileName + " was delivered but can't be deleted (it is not sent again): " + e);
+            logger.error("File " + fileName + " was delivered but can't be " + (moveToSent ? "moved to sent/" : "deleted") + " (it is not sent again): " + e);
             deliveredFiles.put(filePath, snapshot);
             scheduleRetry(filePath, snapshot, fileName);
             return false;
@@ -1039,6 +1071,7 @@ public class JFiltraClient {
         logger.info("Stable Polls: " + stablePolls);
         logger.info("Run Mode: " + (runOnce ? "once" : "loop"));
         logger.info("File Order: " + fileOrder);
+        logger.info("After Send: " + (moveToSent ? "move (to sent/)" : "delete"));
         logger.info("File Mask: " + fileMask);
         logger.info("Ignore Patterns: " + (ignorePatterns.isEmpty() ? "(none)" : ignorePatterns));
         logger.info("-----------------------------------------");

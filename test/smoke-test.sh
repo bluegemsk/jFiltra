@@ -312,6 +312,30 @@ sed -i 's/^run.mode=.*/run.mode=twice/' "$C5/config/client.properties"
 code="$(run_once name)"
 check "invalid run.mode exits with 1" [ "$code" = 1 ]
 check "invalid run.mode message names the values" grep -q "run.mode must be loop or once, but is: twice" "$C5/once.log"
+sed -i 's/^run.mode=.*/run.mode=once/' "$C5/config/client.properties"
+
+echo "after.send=move"
+check "delete is the default after.send" grep -q "After Send: delete" "$CLIENT_LOG"
+echo "after.send=Move " >> "$C5/config/client.properties"
+rm -rf "$WORK/src5" && mkdir -p "$WORK/src5" && echo "moved content" > "$WORK/src5/m1.txt"
+code="$(run_once name)"
+check "move: exit 0 and file gone from source" [ "$code" = 0 -a ! -e "$WORK/src5/m1.txt" ]
+check "move: file in sent/ with the same content" cmp -s "$WORK/src5/sent/m1.txt" <(echo "moved content")
+check "move: file delivered to the server" cmp -s "$WORK/received/client5/m1.txt" <(echo "moved content")
+code="$(run_once name)"
+check "move: files in sent/ not sent again (empty outbox exits 2)" [ "$code" = 2 ]
+rm -f "$WORK/received/client5/m1.txt"; echo "newer content" > "$WORK/src5/m1.txt"
+code="$(run_once name)"
+check "move: same name in sent/ replaced" [ "$code" = 0 ] && cmp -s "$WORK/src5/sent/m1.txt" <(echo "newer content")
+rm -rf "$WORK/src5" && mkdir -p "$WORK/src5" && echo x > "$WORK/src5/sent" && echo y > "$WORK/src5/m2.txt"
+echo "filemask=m*.txt" >> "$C5/config/client.properties"
+code="$(run_once name)"
+check "move: 'sent' file in the way keeps the file and names the problem" \
+  [ -f "$WORK/src5/m2.txt" ] && grep -q "m2.txt was delivered but can't be moved to sent/.*is not a directory" "$C5/once.log" "$C5/logs/client_jfiltra.log"
+sed -i '/^filemask=/d; s/^after.send=.*/after.send=archive/' "$C5/config/client.properties"
+code="$(run_once name)"
+check "invalid after.send exits with 1" [ "$code" = 1 ]
+check "invalid after.send message names the values" grep -q "after.send must be delete or move, but is: archive" "$C5/once.log"
 
 echo "Duplicates"
 echo "same content" > "$WORK/src1/same.txt"

@@ -2,12 +2,13 @@
 
 jFiltra is a lightweight Java client/server tool for moving files from watched
 directories to a central server, reliably and with as little setup as possible.
-Current version: **1.1.5** (server, client and DB client share the version).
+Current version: **1.1.6** (server, client and DB client share the version).
 
 - The **client** polls one or more source directories. For each file it computes a
   SHA-256 hash, compresses the file with GZIP, scrambles it with AES using a
   client-specific key, and sends it to the server. After the server confirms
-  receipt, the client deletes the original file.
+  receipt, the client deletes the original file (or, with `after.send=move`,
+  moves it to a `sent/` subdirectory of its source directory).
 - The **server** accepts connections from multiple clients. It looks up the
   client's key, decrypts and decompresses the file, checks the SHA-256 hash, and
   stores the file in that client's configured storage directory.
@@ -179,6 +180,7 @@ stored in `server/incoming/`. The storage directory is created if it doesn't exi
 | `stable.polls`             | No       | Number of scans a file must stay unchanged before it is sent (default `2`) |
 | `run.mode`                 | No       | `loop` (default): run continuously; `once`: send one file and exit. See [One-time run](#one-time-run) |
 | `file.order`               | No       | Order in which files are sent: `time` (default, oldest first), `size` (smallest first) or `name` (A to Z); a leading `!` reverses it, e.g. `!time`. See [File order](#file-order) |
+| `after.send`               | No       | What happens to a file after the server stored it: `delete` (default) or `move` to `sent/` inside its source directory. See [How transfers behave](#how-transfers-behave) |
 | `filemask`                 | No       | File name masks of the files to send, separated by `,` or `;` (default `*`: all files). See [File mask](#file-mask) |
 | `ignore.patterns`          | No       | Comma-separated file name patterns that are never sent, not case-sensitive (default `.*,*.part,*.tmp,*.crdownload,~$*`; empty sends everything) |
 
@@ -253,10 +255,10 @@ Exit codes (in both modes, 1 also means a configuration error at startup):
 
 | Code | Meaning |
 |------|---------|
-| `0`  | The file was sent and deleted from the source directory |
+| `0`  | The file was sent and removed from the source directory (deleted, or moved to `sent/`) |
 | `1`  | Configuration error (missing or invalid setting, missing config file) |
 | `2`  | Nothing to send: no matching file, or every file is still being written or rejected for good |
-| `3`  | Transfer failed: server not reachable, file rejected by the server, file not readable, or sent but not deletable |
+| `3`  | Transfer failed: server not reachable, file rejected by the server, file not readable, or sent but not deletable or movable |
 
 ### Keys
 
@@ -378,6 +380,12 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
   deleting it, so the new content is not lost.
 - The client deletes a file only after the server replies with success. In all
   other cases the file stays where it is and is retried (see [Retries](#retries)).
+- With `after.send=move` the file is moved instead of deleted, to `sent/` inside
+  its source directory (created when needed; the name is fixed). A file of the same
+  name already in `sent/` is replaced. Because subdirectories are not scanned,
+  files in `sent/` are never sent again. Nothing cleans up `sent/`; remove old files
+  there yourself (for example with a cron job). If `sent` exists but is not a
+  directory, the file is handled like one that can't be deleted (see below).
 - When the server rejects a file, the client logs the reason, for example
   `Server rejected file report.pdf: ERROR: File already exists`. The server log
   has the details. A wrong key is reported as `ERROR: Decryption failed`.
@@ -424,8 +432,9 @@ every poll:
   10 minutes, so it can't hold up the other files. A file that is too large is
   rejected by the server before it reads the data; the client reads that reply
   even when the server closed the connection during the send.
-- **Delivered, but the client can't delete it** (no permission): the file is
-  **not sent again**. Only the delete is retried, with the same growing delays,
+- **Delivered, but the client can't delete (or move) it** (no permission, or a
+  file named `sent` in the way): the file is **not sent again**. Only the delete
+  or move is retried, with the same growing delays,
   so the server never gets it twice (this matters for `append` and `rename`).
   After a client restart the file is sent once more.
 - **Rejected for a reason a person can fix** (`File already exists`, `Decryption
