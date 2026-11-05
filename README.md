@@ -616,19 +616,13 @@ The same test runs on GitHub on every push: on Java 8, 11, 17 and 21, and once
 with JARs built on Java 21 and run on Java 8; the DB client test runs against
 PostgreSQL and MySQL there (GitHub service containers).
 
-## Roadmap
-
-Ideas for later versions, kept out so far to keep jFiltra simple:
-
-- Scanning subdirectories of the source directories
-- Moving sent files to a `sent/` directory instead of deleting them
 
 ## Support this project
 
 jFiltra is free. If it helps you, consider sending a small crypto donation:
 
 - **SOL**: `DL5sEEG6z666vyety2FdDZtTF1pMtMAnjKXSdZTYg34K`
-- **BNB**: `0xC08f5CC86610e400bb3c12Fe8a085514F7e786E0`
+
 
 ## License
 
