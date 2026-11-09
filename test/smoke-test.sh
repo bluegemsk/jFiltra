@@ -128,6 +128,9 @@ if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/server/lib/*" -d "$WORK/unit"
   check "reload detects size and unsettled/two-step writes" [ "$?" = 0 ]
   check "reload error names the label and reason" grep -q 'Encryption key for test is too short' "$WORK/reload-test.log"
   check "reload error does not expose the key value" bash -c '! grep -q SecretLeak_X "$1"' _ "$WORK/reload-test.log"
+  check "unchanged parsed content does not produce Reloaded lines" [ "$(awk '/UNCHANGED_RELOAD_BEGIN/{active=1;next} /UNCHANGED_RELOAD_END/{active=0} active && /Reloaded /{n++} END{print n+0}' "$WORK/reload-test.log")" = 0 ]
+  check "future mtime reload logs each changed mapping only once" [ "$(awk '/FUTURE_RELOAD_BEGIN/{active=1;next} /FUTURE_RELOAD_END/{active=0} active && /Reloaded /{n++} END{print n+0}' "$WORK/reload-test.log")" = 2 ]
+  check "future startup mtime causes no repeated Reloaded lines" [ "$(awk '/FUTURE_STARTUP_BEGIN/{active=1;next} /FUTURE_STARTUP_END/{active=0} active && /Reloaded /{n++} END{print n+0}' "$WORK/reload-test.log")" = 0 ]
 else
   check "reload regression tests compile" false
 fi
@@ -564,6 +567,39 @@ for action in delete move; do
   check "$action: once succeeds after permissions restored" [ "$?" = 0 ]
   check "$action: appended exactly once across four runs" cmp -s "$WORK/received/parallel/$action.txt" <(echo "$action content")
 done
+# G1: a writable sent/ does not compensate for a read-only source directory.
+rm -rf "$WORK/src6" && mkdir -p "$WORK/src6/sent"
+echo source-read-only > "$WORK/src6/a-source-ro.txt"; echo next > "$WORK/src6/b-source-ro.txt"
+write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+printf 'run.mode=once\nafter.send=move\nfile.order=name\n' >> "$WORK/client6/config/client.properties"
+chmod 555 "$WORK/src6"
+for attempt in 1 2 3; do
+  (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile="$WORK/client6/config/log4j2.properties" -cp 'lib/*' client.JFiltraClient config/client.properties > "source-ro-$attempt.log" 2>&1)
+  check "move/source read-only: run $attempt exits 3, no append" [ "$?" = 3 -a ! -e "$WORK/received/parallel/a-source-ro.txt" -a ! -e "$WORK/received/parallel/b-source-ro.txt" ]
+  check "move/source read-only: run $attempt logs source once, skips its other file" [ "$(count "ERROR.*Cannot send .*not a writable directory: $WORK/src6$" "$WORK/client6/source-ro-$attempt.log")" = 1 ]
+done
+chmod 755 "$WORK/src6"
+# G2: a blocked source directory must not starve a different writable directory.
+for action in delete move; do
+  rm -rf "$WORK/src6" "$WORK/src7"; mkdir -p "$WORK/src6" "$WORK/src7"
+  [ "$action" = move ] && mkdir "$WORK/src6/sent"
+  echo blocked > "$WORK/src6/a-blocked-$action.txt"; echo blocked > "$WORK/src6/b-blocked-$action.txt"
+  echo delivered > "$WORK/src7/z-writable-$action.txt"
+  write_client_config "$WORK/client6" parallel "$WORK/src6,$WORK/src7" "$KEYP" "$MODE_PORT"
+  printf 'run.mode=once\nafter.send=%s\nfile.order=name\n' "$action" >> "$WORK/client6/config/client.properties"
+  chmod 555 "$WORK/src6"
+  (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile="$WORK/client6/config/log4j2.properties" -cp 'lib/*' client.JFiltraClient config/client.properties > "multi-$action.log" 2>&1)
+  check "$action: once skips blocked directory and succeeds from second directory" [ "$?" = 0 -a ! -e "$WORK/src7/z-writable-$action.txt" ]
+  check "$action: blocked files never uploaded" [ ! -e "$WORK/received/parallel/a-blocked-$action.txt" -a ! -e "$WORK/received/parallel/b-blocked-$action.txt" ]
+  check "$action: only one pre-check error for blocked directory" [ "$(count "ERROR.*Cannot send .*not a writable directory: $WORK/src6$" "$WORK/client6/multi-$action.log")" = 1 ]
+  (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile="$WORK/client6/config/log4j2.properties" -cp 'lib/*' client.JFiltraClient config/client.properties > "multi-again-$action.log" 2>&1)
+  check "$action: no remaining deliverable files exits 3" [ "$?" = 3 ]
+  check "$action: second directory file appended exactly once" cmp -s "$WORK/received/parallel/z-writable-$action.txt" <(echo delivered)
+  chmod 755 "$WORK/src6"
+done
+# Restore the single-source move config for the missing-sent check below.
+write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+printf 'run.mode=once\nafter.send=move\nfile.order=name\n' >> "$WORK/client6/config/client.properties"
 # Missing sent/: the source must allow its creation.
 rm -rf "$WORK/src6" && mkdir "$WORK/src6"; echo missing > "$WORK/src6/missing.txt"; chmod 555 "$WORK/src6"
 (cd "$WORK/client6" && "$JAVA" -cp 'lib/*' client.JFiltraClient config/client.properties > missing-sent.log 2>&1)

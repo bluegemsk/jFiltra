@@ -65,7 +65,8 @@ public class JFiltraClient {
     private boolean moveToSent;                 // after.send=move: move sent files to <source>/sent/
     private String fileOrder;                   // file.order: time, size or name, ! reverses
     private Comparator<Candidate> fileComparator; // Order in which files are sent
-    private boolean lastRemovalFailed;          // Stop once mode on pre-check or post-delivery cleanup failure
+    private boolean lastPreCheckFailed;         // Nothing uploaded: skip this source directory in once mode
+    private boolean lastRemovalFailed;          // Stop once mode on post-delivery cleanup failure
     private boolean lastFileSent;               // Whether the last processFile call succeeded
 
     // Files delivered whose deletion failed, with their snapshot: only the delete is retried,
@@ -568,7 +569,11 @@ public class JFiltraClient {
             // Files still being written change within a second; skip them
             Thread.sleep(1000);
             boolean attempted = false;
+            Set<Path> blockedDirs = new HashSet<>();
             for (Candidate candidate : candidates) {
+                if (blockedDirs.contains(candidate.path.getParent())) {
+                    continue;
+                }
                 String snapshot;
                 try {
                     snapshot = fileSnapshot(candidate.path);
@@ -589,6 +594,10 @@ public class JFiltraClient {
                 processFile(candidate.path, snapshot);
                 if (lastFileSent) {
                     return EXIT_SENT;
+                }
+                if (lastPreCheckFailed) {
+                    blockedDirs.add(candidate.path.getParent());
+                    continue;
                 }
                 if (lastRemovalFailed || serverRetryAt != 0) {
                     return EXIT_TRANSFER_FAILED; // Cleanup problem or unreachable server: stop immediately.
@@ -806,23 +815,27 @@ public class JFiltraClient {
         String fileName = filePath.getFileName().toString();
         logger.debug("Processing file: " + fileName);
         long startTime = System.currentTimeMillis();
+        lastPreCheckFailed = false;
         lastRemovalFailed = false;
         // Do not upload a file we already know cannot be removed after delivery.
         Path sourceDir = filePath.getParent();
-        Path removalDir = sourceDir;
+        List<Path> mustBeWritable = new ArrayList<>();
+        mustBeWritable.add(sourceDir); // Both delete and move unlink the source entry.
         if (moveToSent) {
             Path sentDir = sourceDir.resolve("sent");
             if (Files.exists(sentDir, LinkOption.NOFOLLOW_LINKS)) {
-                removalDir = sentDir;
+                mustBeWritable.add(sentDir);
             }
         }
-        if (!Files.isDirectory(removalDir) || !Files.isWritable(removalDir)) {
-            logger.error("Cannot send " + fileName + ": not a writable directory: " + removalDir);
-            lastRemovalFailed = true;
-            if (!runOnce) {
-                scheduleRetry(filePath, snapshot, fileName);
+        for (Path dir : mustBeWritable) {
+            if (!Files.isDirectory(dir) || !Files.isWritable(dir)) {
+                logger.error("Cannot send " + fileName + ": not a writable directory: " + dir);
+                lastPreCheckFailed = true;
+                if (!runOnce) {
+                    scheduleRetry(filePath, snapshot, fileName);
+                }
+                return;
             }
-            return;
         }
 
         try {

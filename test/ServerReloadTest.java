@@ -62,6 +62,32 @@ public class ServerReloadTest {
         updated = reload(server);
         if (reload(server)[0] != updated[0] || reload(server)[1] != updated[1])
             throw new AssertionError("settled mappings must be cached");
+        System.out.println("UNCHANGED_RELOAD_BEGIN");
+        recent = FileTime.fromMillis(System.currentTimeMillis());
+        write(keys, "test=" + b + "\n", recent); write(paths, "test=/final\n", recent);
+        for (int i = 0; i < 5; i++) reload(server);
+        System.out.println("UNCHANGED_RELOAD_END");
+        // Future metadata may trigger one read, but never the unsettled retry window.
+        System.out.println("FUTURE_RELOAD_BEGIN");
+        FileTime future = FileTime.fromMillis(System.currentTimeMillis() + 3600000);
+        write(keys, "test=" + a + "\n", future); write(paths, "test=/future\n", future);
+        updated = reload(server);
+        for (int i = 0; i < 5; i++) {
+            Properties[] again = reload(server);
+            if (again[0] != updated[0] || again[1] != updated[1])
+                throw new AssertionError("future metadata must be settled after reload");
+        }
+        eq(updated[0].getProperty("test"), a); eq(updated[1].getProperty("test"), "/future");
+        System.out.println("FUTURE_RELOAD_END");
+        System.out.println("FUTURE_STARTUP_BEGIN");
+        JFiltraServer futureServer = new JFiltraServer(config.toString());
+        updated = reload(futureServer);
+        for (int i = 0; i < 5; i++) {
+            Properties[] again = reload(futureServer);
+            if (again[0] != updated[0] || again[1] != updated[1])
+                throw new AssertionError("future startup metadata must be settled");
+        }
+        System.out.println("FUTURE_STARTUP_END");
         System.out.println("ServerReloadTest: all passed");
     }
 }

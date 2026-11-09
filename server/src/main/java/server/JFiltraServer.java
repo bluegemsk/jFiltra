@@ -183,14 +183,14 @@ public class JFiltraServer {
             clientKeys = (clientKeysPath != null) ? loadProperties(clientKeysPath.trim()) : new Properties();
             keysModified = clientKeysPath == null ? null : Files.getLastModifiedTime(Paths.get(clientKeysPath.trim()));
             keysSize = clientKeysPath == null ? 0 : Files.size(Paths.get(clientKeysPath.trim()));
-            keysUnsettled = keysModified != null && System.currentTimeMillis() - keysModified.toMillis() < 2000;
+            keysUnsettled = keysModified != null && isUnsettled(keysModified);
             
             // Load client storage path mappings from configuration file
             String clientPathsConfig = config.getProperty("client.paths.config");
             clientPaths = (clientPathsConfig != null) ? loadProperties(clientPathsConfig.trim()) : new Properties();
             pathsModified = clientPathsConfig == null ? null : Files.getLastModifiedTime(Paths.get(clientPathsConfig.trim()));
             pathsSize = clientPathsConfig == null ? 0 : Files.size(Paths.get(clientPathsConfig.trim()));
-            pathsUnsettled = pathsModified != null && System.currentTimeMillis() - pathsModified.toMillis() < 2000;
+            pathsUnsettled = pathsModified != null && isUnsettled(pathsModified);
             
             // Log server startup and configuration details
             logger.info("=========================================");
@@ -232,6 +232,12 @@ public class JFiltraServer {
         }
     }
     
+    /** Only a recent, non-future mtime needs a follow-up read for two-step writes. */
+    private static boolean isUnsettled(FileTime modified) {
+        long age = System.currentTimeMillis() - modified.toMillis();
+        return age >= 0 && age < 2000;
+    }
+
     /** Reload changed mappings before each connection, publishing only complete, valid copies. */
     private synchronized Properties[] clientConfiguration() {
         for (String setting : new String[] {"client.keys.path", "client.paths.config"}) {
@@ -247,8 +253,9 @@ public class JFiltraServer {
                         && size == (keys ? keysSize : pathsSize) && !(keys ? keysUnsettled : pathsUnsettled)) {
                     continue;
                 }
-                boolean unsettled = System.currentTimeMillis() - modified.toMillis() < 2000;
+                boolean unsettled = isUnsettled(modified);
                 Properties updated = loadProperties(path.trim());
+                boolean changed = !updated.equals(keys ? clientKeys : clientPaths);
                 if (keys) {
                     for (String label : updated.stringPropertyNames()) {
                         checkKeyStrength(label, updated.getProperty(label));
@@ -263,7 +270,9 @@ public class JFiltraServer {
                     pathsSize = size;
                     pathsUnsettled = unsettled;
                 }
-                logger.info("Reloaded " + setting);
+                if (changed) {
+                    logger.info("Reloaded " + setting);
+                }
             } catch (IOException | IllegalArgumentException e) {
                 // Our loader and key validation report the path/label, never a key value.
                 logger.error("Cannot reload " + setting + "; keeping last good configuration: "

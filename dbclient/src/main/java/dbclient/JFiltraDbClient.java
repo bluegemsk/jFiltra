@@ -506,9 +506,10 @@ public class JFiltraDbClient {
      * ; and }} for }), "double-quoted" or 'single-quoted' only when the closing quote is
      * at the end or followed by &amp;, ;, whitespace, or ) in a (key=...) form (C1b: otherwise
      * e.g. "Wq8"Er5 is masked as one unquoted value), or runs up to the next &amp; or
-     * whitespace, and also up to ) when the character before the keyword is ( (MySQL
-     * address=; C1b/C1c: ; is part of the value, and spaces end it so multi-line errors
-     * stay readable). A simple scan, no regular expression; each part of the text is
+     * whitespace, and up to ) in a parenthesized MySQL setting. A comma-led key in a
+     * host group also ends at the next comma. Otherwise ; is part of an unquoted
+     * value; diagnostic spaces end it so multi-line errors stay readable (C1b/C1c).
+     * A simple scan, no regular expression; each part of the text is
      * searched for a closing brace or quote only once, so the time grows linearly with
      * the length of the text (B2).
      *
@@ -525,7 +526,13 @@ public class JFiltraDbClient {
         Closer doubleQuotes = new Closer(s, '"');
         Closer singleQuotes = new Closer(s, '\'');
         int i = 0;
+        int parenDepth = 0;
         while (i < n) {
+            if (s.charAt(i) == '(') {
+                parenDepth++;
+            } else if (s.charAt(i) == ')' && parenDepth > 0) {
+                parenDepth--;
+            }
             int keyword = 0;
             for (String k : PASSWORD_KEYWORDS) {
                 if (s.regionMatches(true, i, k, 0, k.length())) {
@@ -537,8 +544,10 @@ public class JFiltraDbClient {
                 i++;
                 continue;
             }
-            // MySQL address=(...)(password=...): ) ends the value only in this form (C1b)
-            boolean parenForm = i > 0 && s.charAt(i - 1) == '(';
+            // Parenthesized settings end at ')'; comma-led MySQL host settings also
+            // end at ','. Keep literal commas in legacy (password=Ab,cd) values.
+            boolean commaForm = i > 0 && s.charAt(i - 1) == ',' && parenDepth > 0;
+            boolean parenForm = i > 0 && (s.charAt(i - 1) == '(' || commaForm);
             int j = i + keyword;
             while (j < n && isRegexSpace(s.charAt(j))) {
                 j++;
@@ -564,7 +573,8 @@ public class JFiltraDbClient {
                                 || s.charAt(closed) == '&'
                                 || s.charAt(closed) == ';'
                                 || isRegexSpace(s.charAt(closed))
-                                || (parenForm && s.charAt(closed) == ')');
+                                || (parenForm && s.charAt(closed) == ')')
+                                || (commaForm && s.charAt(closed) == ',');
                         if (okAfter) {
                             end = closed; // Properly quoted value (includes the quotes)
                         }
@@ -579,7 +589,8 @@ public class JFiltraDbClient {
                 end = valueStart;
                 while (end < n) {
                     char ch = s.charAt(end);
-                    if (ch == '&' || (!jdbcUrl && isRegexSpace(ch)) || (parenForm && ch == ')')) {
+                    if (ch == '&' || (!jdbcUrl && isRegexSpace(ch))
+                            || (parenForm && ch == ')') || (commaForm && ch == ',')) {
                         break;
                     }
                     end++;

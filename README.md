@@ -166,7 +166,8 @@ stored in `server/incoming/`. The storage directory is created if it doesn't exi
 
 Client key and storage-path mappings are reloaded per connection when their file
 modification time or size changes. Recently modified files are rechecked on each
-connection until unchanged for 2 seconds. Invalid updates are logged with the reason;
+connection until unchanged for 2 seconds; future mtimes are treated as settled.
+`Reloaded` is logged only when the parsed content changes. Invalid updates are logged with the reason;
 the last good copy stays active.
 
 ### Client
@@ -257,10 +258,11 @@ client/script/start-client.sh; echo "exit code $?"
 - A per-file failure is skipped and the next file in order is tried in the same
   run. An unreachable server stops the run immediately. If all attempted files
   fail, the exit code is 3. Retries are deferred to the next run.
-- Before each send, `after.send=delete` requires a writable source directory.
-  With `after.send=move`, an existing `sent/` must be a writable directory; if it
-  is missing, the source directory must be writable so `sent/` can be created.
-  A failed check prevents the send and immediately ends a one-time run with exit 3.
+- Before each send, the source directory must be writable for both `delete` and
+  `move`. With `after.send=move`, an existing `sent/` must additionally be a writable
+  directory. A failed pre-check prevents the send and blocks only that source
+  directory for the rest of this run; candidates in other directories are still
+  tried. Exit 0 if a file succeeds, or 3 if none succeeds and a check/transfer fails.
 - If deletion/moving still fails after delivery (for example permissions change
   during transfer), once mode stops immediately with exit 3, without sending any
   further files. Fix the permissions and remove or move the already-delivered file
@@ -405,7 +407,10 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
   old files there yourself (for example with a cron job). A regular file named
   `sent` (any letter case) is never sent: that name is reserved for the archive
   folder; rename or remove it. If `sent` exists but is not a directory (and not a
-  link to one), the file is handled like one that can't be deleted (see below).
+  link to one), no file of that source directory is sent. The client logs
+  `Cannot send …: not a writable directory`. Once mode skips the directory and
+  exits 3 if no file from another directory succeeds; loop mode retries the check
+  with growing delays.
 - When the server rejects a file, the client logs the reason, for example
   `Server rejected file report.pdf: ERROR: File already exists`. The server log
   has the details. A wrong key is reported as `ERROR: Decryption failed`.
@@ -441,7 +446,9 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
 
 Before sending, the client checks directory writability as described under
 [One-time run](#one-time-run). An unwritable directory is logged and no upload is
-attempted. Loop mode retries the check later; once mode exits 3 immediately.
+attempted. Loop mode retries the check later. Once mode skips the remaining files
+of that source directory and continues with other directories; if none succeeds,
+it exits 3.
 
 The client never gives up on a file, but it waits longer between attempts when
 retrying doesn't help right away, so a large file isn't sent again in full on

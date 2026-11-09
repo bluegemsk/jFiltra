@@ -173,6 +173,14 @@ public class DbFormatTest {
         eq(JFiltraDbClient.urlPasswords("jdbc:x://h?password=ab)cd ef&x=1").toString(), "[ab)cd ef]");
         eq(JFiltraDbClient.urlPasswords("jdbc:x://(password=ab)cdef)/db").toString(), "[ab]");
         eq(JFiltraDbClient.safe("Driver rejected ab)cdef", JFiltraDbClient.urlPasswords("jdbc:x://h?password=ab)cdef&x=1")), "Driver rejected ****");
+        eq(JFiltraDbClient.urlPasswords("jdbc:mysql://(host=h,password=Zx9 y8)/db").toString(), "[Zx9 y8]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:mysql://(host=h,password=Zx9 y8,port=3306)/db").toString(), "[Zx9 y8]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:mysql://(host=h,password=Zx9 y8,pwd=other secret)/db").toString(), "[Zx9 y8, other secret]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:mysql://(host=h,password=\"Zx9 y8\",port=3306)/db").toString(), "[\"Zx9 y8\", Zx9 y8]");
+        eq(JFiltraDbClient.safe("Invalid password Zx9 y8 for user u", JFiltraDbClient.urlPasswords("jdbc:mysql://(host=h,password=Zx9 y8)/db")),
+                "Invalid password **** for user u");
+        eq(JFiltraDbClient.mask("jdbc:mysql://(host=h,password=secret,port=3306)/db"), "jdbc:mysql://(host=h,password=****,port=3306)/db");
+        eq(JFiltraDbClient.urlPasswords("jdbc:x://h?password=ab)cdef&ssl=1").toString(), "[ab)cdef]");
         // Partial quote then more text: whole value masked (C1b)
         eq(JFiltraDbClient.mask("jdbc:x://h/db?password=\"Wq8\"Er5&ssl=1"), "jdbc:x://h/db?password=****&ssl=1");
         eq(JFiltraDbClient.mask("jdbc:x://h/db?password='Fg6'Hj7&ssl=1"), "jdbc:x://h/db?password=****&ssl=1");

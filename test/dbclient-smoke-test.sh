@@ -567,7 +567,9 @@ check "hanging driver: connection aborted, not closed" grep -q "HangDriver: abor
 check "hanging driver: logged as unexpected error" grep -q "stops after an unexpected error.*OutOfMemoryError reported by the database driver" "$D/once.log"
 
 echo "Passwords not logged"
-for url in "jdbc:nosuchdb://127.0.0.1:1/db?password=ab)SECRETPW99&x=1" \
+for url in "jdbc:nosuchdb://(host=h,password=SECRET PW99,port=1)/db" \
+           "jdbc:nosuchdb://(host=h,password=SECRET PW99)/db" \
+           "jdbc:nosuchdb://127.0.0.1:1/db?password=ab)SECRETPW99&x=1" \
            "jdbc:nosuchdb://127.0.0.1:1/db?password=\"SECRET PW99\";x=1" \
            "jdbc:nosuchdb://127.0.0.1:1/db?password=SECRET PW99&x=1" \
            "jdbc:nosuchdb://jfuser:SECRETPW99@127.0.0.1:1/db?user=x&password=SECRETPW99" \
