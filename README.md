@@ -4,6 +4,32 @@ jFiltra is a lightweight Java client/server tool for moving files from watched
 directories to a central server, reliably and with as little setup as possible.
 Current version: **1.1.8** (server, client and DB client share the version).
 
+## Status
+
+1.1.8 (November 2026) is the current stable version. It has passed
+four rounds of testing with no open bugs:
+
+- Bundled suites pass on Temurin 21.0.13 and Temurin 1.8.0_512: the file client and server smoke test
+  (185 checks), the DB client smoke test against PostgreSQL 17.11 and MariaDB 11.4.13
+  (with the PostgreSQL, MariaDB and MySQL Connector/J drivers), and the Java
+  version script test (48 cases).
+- Long run on Java 8: 300 files from two source directories with `after.send=move`,
+  port probes and a key file change during the run. All files arrived intact, with
+  no warnings or errors.
+- Changes in 1.1.8:
+  - The server keeps running when accepting a connection fails, and logs ordinary
+    network events on one line without stack traces.
+  - The server reloads the key and path files without a restart.
+  - A wrong key is refused even for a file that is already stored.
+  - In `once` mode, one stuck file or directory no longer blocks the others.
+  - With `after.send`, the client checks before sending that it will be able to
+    delete or move the file.
+  - Clearer errors for `filemask` and `ignore.patterns`.
+  - The scripts accept Java versions with a suffix (`25-ea`, `17-internal`).
+  - The DB client hides passwords in logs more reliably.
+
+Not tested yet: Windows (`.bat` scripts), macOS, network shares, and MySQL and Oracle servers.
+
 - The **client** polls one or more source directories. For each file it computes a
   SHA-256 hash, compresses the file with GZIP, scrambles it with AES using a
   client-specific key, and sends it to the server. After the server confirms
