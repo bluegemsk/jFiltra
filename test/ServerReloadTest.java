@@ -88,6 +88,21 @@ public class ServerReloadTest {
                 throw new AssertionError("future startup metadata must be settled");
         }
         System.out.println("FUTURE_STARTUP_END");
+        // A revert can restore the exact last-good metadata as well as its contents.
+        // Error state must force a successful retry and exactly one recovery message.
+        System.out.println("KEYS_RECOVERY_BEGIN");
+        FileTime badTime = FileTime.fromMillis(future.toMillis() + 1);
+        write(keys, "test=short\n", badTime);
+        for (int i = 0; i < 3; i++) eq(reload(server)[0].getProperty("test"), a);
+        write(keys, "test=" + a + "\n", future);
+        for (int i = 0; i < 10; i++) eq(reload(server)[0].getProperty("test"), a);
+        System.out.println("KEYS_RECOVERY_END");
+        System.out.println("PATHS_RECOVERY_BEGIN");
+        write(paths, "test=" + (char) 92 + "uZZZZ\n", badTime);
+        for (int i = 0; i < 3; i++) eq(reload(server)[1].getProperty("test"), "/future");
+        write(paths, "test=/future\n", future);
+        for (int i = 0; i < 10; i++) eq(reload(server)[1].getProperty("test"), "/future");
+        System.out.println("PATHS_RECOVERY_END");
         System.out.println("ServerReloadTest: all passed");
     }
 }

@@ -528,7 +528,10 @@ public class JFiltraDbClient {
         int i = 0;
         int parenDepth = 0;
         while (i < n) {
-            if (s.charAt(i) == '(') {
+            char current = s.charAt(i);
+            if (current == '?' || current == '&' || current == ';') {
+                parenDepth = 0; // A new parameter section cannot inherit an earlier open group.
+            } else if (current == '(') {
                 parenDepth++;
             } else if (s.charAt(i) == ')' && parenDepth > 0) {
                 parenDepth--;

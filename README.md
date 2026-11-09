@@ -167,7 +167,9 @@ stored in `server/incoming/`. The storage directory is created if it doesn't exi
 Client key and storage-path mappings are reloaded per connection when their file
 modification time or size changes. Recently modified files are rechecked on each
 connection until unchanged for 2 seconds; future mtimes are treated as settled.
-`Reloaded` is logged only when the parsed content changes. Invalid updates are logged with the reason;
+`Reloaded` is logged only when the parsed content changes. After a reload error,
+the first successful reload logs `<setting> is valid again`, even when reverting
+to the active content. Invalid updates are logged with the reason;
 the last good copy stays active.
 
 ### Client

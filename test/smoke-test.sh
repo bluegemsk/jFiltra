@@ -131,6 +131,9 @@ if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/server/lib/*" -d "$WORK/unit"
   check "unchanged parsed content does not produce Reloaded lines" [ "$(awk '/UNCHANGED_RELOAD_BEGIN/{active=1;next} /UNCHANGED_RELOAD_END/{active=0} active && /Reloaded /{n++} END{print n+0}' "$WORK/reload-test.log")" = 0 ]
   check "future mtime reload logs each changed mapping only once" [ "$(awk '/FUTURE_RELOAD_BEGIN/{active=1;next} /FUTURE_RELOAD_END/{active=0} active && /Reloaded /{n++} END{print n+0}' "$WORK/reload-test.log")" = 2 ]
   check "future startup mtime causes no repeated Reloaded lines" [ "$(awk '/FUTURE_STARTUP_BEGIN/{active=1;next} /FUTURE_STARTUP_END/{active=0} active && /Reloaded /{n++} END{print n+0}' "$WORK/reload-test.log")" = 0 ]
+  check "keys revert logs valid again exactly once" [ "$(awk '/KEYS_RECOVERY_BEGIN/{active=1;next} /KEYS_RECOVERY_END/{active=0} active && /client.keys.path is valid again/{n++} END{print n+0}' "$WORK/reload-test.log")" = 1 ]
+  check "paths revert logs valid again exactly once" [ "$(awk '/PATHS_RECOVERY_BEGIN/{active=1;next} /PATHS_RECOVERY_END/{active=0} active && /client.paths.config is valid again/{n++} END{print n+0}' "$WORK/reload-test.log")" = 1 ]
+  check "reverting to active content adds no Reloaded lines" [ "$(awk '/KEYS_RECOVERY_BEGIN|PATHS_RECOVERY_BEGIN/{active=1;next} /KEYS_RECOVERY_END|PATHS_RECOVERY_END/{active=0} active && /Reloaded /{n++} END{print n+0}' "$WORK/reload-test.log")" = 0 ]
 else
   check "reload regression tests compile" false
 fi

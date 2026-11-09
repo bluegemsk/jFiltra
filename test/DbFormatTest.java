@@ -181,6 +181,21 @@ public class DbFormatTest {
                 "Invalid password **** for user u");
         eq(JFiltraDbClient.mask("jdbc:mysql://(host=h,password=secret,port=3306)/db"), "jdbc:mysql://(host=h,password=****,port=3306)/db");
         eq(JFiltraDbClient.urlPasswords("jdbc:x://h?password=ab)cdef&ssl=1").toString(), "[ab)cdef]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:postgresql://h/db?application_name=(app&user=u,password=Lo,ng1pass&x=1").toString(), "[Lo,ng1pass]");
+        eq(JFiltraDbClient.safe("Invalid password Lo,ng1pass for user u", JFiltraDbClient.urlPasswords("jdbc:postgresql://h/db?application_name=(app&user=u,password=Lo,ng1pass&x=1")),
+                "Invalid password **** for user u");
+        // Each section delimiter must clear group state, not only the ampersand above.
+        for (String delimiter : new String[] {"?", "&", ";"}) {
+            eq(JFiltraDbClient.urlPasswords("jdbc:x://h/(unfinished" + delimiter + "user=u,password=Lo,ng1pass&x=1").toString(), "[Lo,ng1pass]");
+        }
+        // Exact report-table regressions: adjacent groups, bracket lists and quoted commas.
+        eq(JFiltraDbClient.urlPasswords("jdbc:mysql://(host=h,user=u,password=Ab12cd)(host=h2,password=Ef34gh)/db").toString(), "[Ab12cd, Ef34gh]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:mysql://[(host=h1,password=Aa11bb),(host=h2,password=Cc22dd)]/db").toString(), "[Aa11bb, Cc22dd]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:mysql://(host=h,password=\"Qu ot,ed\",port=1)/db").toString(), "[\"Qu ot,ed\", Qu ot,ed]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:mysql://(host=h,password='Qu ot,ed',port=1)/db").toString(), "['Qu ot,ed', Qu ot,ed]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:mysql://address=(host=h)(password=Ab,cd9XyZ)/db").toString(), "[Ab,cd9XyZ]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:postgresql://h/db?password=Ab,cd(ef&ssl=1").toString(), "[Ab,cd(ef]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:sqlserver://h;databaseName=(x;password=Pa,ss9word;encrypt=true").toString(), "[Pa,ss9word;encrypt=true]");
         // Partial quote then more text: whole value masked (C1b)
         eq(JFiltraDbClient.mask("jdbc:x://h/db?password=\"Wq8\"Er5&ssl=1"), "jdbc:x://h/db?password=****&ssl=1");
         eq(JFiltraDbClient.mask("jdbc:x://h/db?password='Fg6'Hj7&ssl=1"), "jdbc:x://h/db?password=****&ssl=1");

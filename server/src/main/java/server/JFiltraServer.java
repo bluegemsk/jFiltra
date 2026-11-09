@@ -132,6 +132,7 @@ public class JFiltraServer {
     private FileTime keysModified, pathsModified;
     private long keysSize, pathsSize;
     private boolean keysUnsettled, pathsUnsettled;
+    private boolean keysReloadFailed, pathsReloadFailed;
     private Properties clientPaths;   // Maps client IDs to their storage directories
 
     /**
@@ -250,12 +251,14 @@ public class JFiltraServer {
                 FileTime modified = Files.getLastModifiedTime(Paths.get(path.trim()));
                 long size = Files.size(Paths.get(path.trim()));
                 if (modified.equals(keys ? keysModified : pathsModified)
-                        && size == (keys ? keysSize : pathsSize) && !(keys ? keysUnsettled : pathsUnsettled)) {
+                        && size == (keys ? keysSize : pathsSize) && !(keys ? keysUnsettled : pathsUnsettled)
+                        && !(keys ? keysReloadFailed : pathsReloadFailed)) {
                     continue;
                 }
                 boolean unsettled = isUnsettled(modified);
                 Properties updated = loadProperties(path.trim());
                 boolean changed = !updated.equals(keys ? clientKeys : clientPaths);
+                boolean recovered = keys ? keysReloadFailed : pathsReloadFailed;
                 if (keys) {
                     for (String label : updated.stringPropertyNames()) {
                         checkKeyStrength(label, updated.getProperty(label));
@@ -264,16 +267,26 @@ public class JFiltraServer {
                     keysModified = modified;
                     keysSize = size;
                     keysUnsettled = unsettled;
+                    keysReloadFailed = false;
                 } else {
                     clientPaths = updated;
                     pathsModified = modified;
                     pathsSize = size;
                     pathsUnsettled = unsettled;
+                    pathsReloadFailed = false;
                 }
                 if (changed) {
                     logger.info("Reloaded " + setting);
                 }
+                if (recovered) {
+                    logger.info(setting + " is valid again");
+                }
             } catch (IOException | IllegalArgumentException e) {
+                if (keys) {
+                    keysReloadFailed = true;
+                } else {
+                    pathsReloadFailed = true;
+                }
                 // Our loader and key validation report the path/label, never a key value.
                 logger.error("Cannot reload " + setting + "; keeping last good configuration: "
                         + printable(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
