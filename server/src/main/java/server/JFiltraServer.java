@@ -12,6 +12,8 @@ import java.io.*;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -28,6 +30,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileTime;
 import java.security.DigestOutputStream;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
@@ -68,7 +71,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraServer {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.1.7";
+    private static final String VERSION = "1.1.8";
     
     // Logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraServer.class);
@@ -79,8 +82,8 @@ public class JFiltraServer {
     // Server network configuration
     private int port;
     private InetAddress bindAddress;     // Address to listen on; null means all interfaces
-    private ServerSocket serverSocket;
-    private boolean running;
+    private volatile ServerSocket serverSocket;
+    private volatile boolean running;
     
     // Limits that protect the server from stalled, slow or oversized transfers
     private int socketTimeoutSeconds;    // Max wait for data from a client before giving up
@@ -126,6 +129,7 @@ public class JFiltraServer {
     
     // Client-specific configuration
     private Properties clientKeys;    // Maps client IDs to their encryption keys
+    private FileTime keysModified, pathsModified;
     private Properties clientPaths;   // Maps client IDs to their storage directories
 
     /**
@@ -175,10 +179,12 @@ public class JFiltraServer {
             // Load client encryption keys from separate file for better security
             String clientKeysPath = config.getProperty("client.keys.path");
             clientKeys = (clientKeysPath != null) ? loadProperties(clientKeysPath.trim()) : new Properties();
+            keysModified = clientKeysPath == null ? null : Files.getLastModifiedTime(Paths.get(clientKeysPath.trim()));
             
             // Load client storage path mappings from configuration file
             String clientPathsConfig = config.getProperty("client.paths.config");
             clientPaths = (clientPathsConfig != null) ? loadProperties(clientPathsConfig.trim()) : new Properties();
+            pathsModified = clientPathsConfig == null ? null : Files.getLastModifiedTime(Paths.get(clientPathsConfig.trim()));
             
             // Log server startup and configuration details
             logger.info("=========================================");
@@ -220,6 +226,40 @@ public class JFiltraServer {
         }
     }
     
+    /** Reload changed mappings before each connection, publishing only complete, valid copies. */
+    private synchronized Properties[] clientConfiguration() {
+        for (String setting : new String[] {"client.keys.path", "client.paths.config"}) {
+            String path = config.getProperty(setting);
+            if (path == null) {
+                continue;
+            }
+            boolean keys = setting.equals("client.keys.path");
+            try {
+                FileTime modified = Files.getLastModifiedTime(Paths.get(path.trim()));
+                if (modified.equals(keys ? keysModified : pathsModified)) {
+                    continue;
+                }
+                Properties updated = loadProperties(path.trim());
+                if (keys) {
+                    for (String label : updated.stringPropertyNames()) {
+                        checkKeyStrength(label, updated.getProperty(label));
+                    }
+                    clientKeys = updated;
+                    keysModified = modified;
+                } else {
+                    clientPaths = updated;
+                    pathsModified = modified;
+                }
+                logger.info("Reloaded " + setting);
+            } catch (IOException | IllegalArgumentException e) {
+                // Do not log parser details: they could contain a key from the file.
+                logger.error("Cannot reload " + setting + "; keeping last good configuration ("
+                        + e.getClass().getSimpleName() + ")");
+            }
+        }
+        return new Properties[] {clientKeys, clientPaths};
+    }
+
     /**
      * Loads a properties file as UTF-8, so keys and paths can contain any characters.
      * A UTF-8 byte order mark (added by some Windows editors) is ignored, and
@@ -383,7 +423,23 @@ public class JFiltraServer {
             
             // Main server loop - accept connections and process in separate threads
             while (running) {
-                Socket clientSocket = serverSocket.accept();
+                final Socket clientSocket;
+                try {
+                    clientSocket = serverSocket.accept();
+                } catch (IOException e) {
+                    if (!running) {
+                        break;
+                    }
+                    logger.error("Error accepting connection: " + e);
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException interrupted) {
+                        if (!running) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 InetAddress clientAddress = clientSocket.getInetAddress();
                 
                 // Limit connections per IP address, so a single host can't occupy every worker
@@ -540,8 +596,9 @@ public class JFiltraServer {
         String logName = "?";
         
         try {
-            // Log client connection with IP address for audit purposes
-            logger.info("Client connected: " + clientSocket.getInetAddress().getHostAddress());
+            Properties[] mappings = clientConfiguration();
+            Properties connectionKeys = mappings[0];
+            Properties connectionPaths = mappings[1];
             
             // Don't let a stalled or idle connection hold a worker thread forever
             clientSocket.setSoTimeout(socketTimeoutSeconds * 1000);
@@ -553,6 +610,16 @@ public class JFiltraServer {
             DataInputStream dis = new DataInputStream(new BufferedInputStream(clientSocket.getInputStream(), 65536));
             dos = new DataOutputStream(clientSocket.getOutputStream());
             
+            dis.mark(1);
+            // Peek at the first byte so a health probe (connect then close) stays debug-only.
+            if (dis.read() == -1) {
+                logger.debug("Client closed connection without data: " + clientSocket.getInetAddress().getHostAddress());
+                return;
+            }
+            // Recreate the first byte for readUTF without consuming any header data.
+            // mark/reset is supported by the BufferedInputStream below.
+            dis.reset();
+            logger.info("Client connected: " + clientSocket.getInetAddress().getHostAddress());
             // Read client identification label (used to determine encryption key and storage path)
             String clientLabel = dis.readUTF();
             logLabel = printable(clientLabel);
@@ -594,7 +661,7 @@ public class JFiltraServer {
             }
             
             // Look up encryption key for this client before writing anything to disk
-            String encryptionKey = clientKeys.getProperty(clientLabel);
+            String encryptionKey = connectionKeys.getProperty(clientLabel);
             if (encryptionKey == null) {
                 // Security error - client not authorized or missing key
                 logger.error("No encryption key found for client: " + logLabel);
@@ -605,7 +672,7 @@ public class JFiltraServer {
             }
             
             // Determine storage location for this client
-            String clientStoragePath = clientPaths.getProperty(clientLabel);
+            String clientStoragePath = connectionPaths.getProperty(clientLabel);
             if (clientStoragePath != null) {
                 clientStoragePath = clientStoragePath.trim(); // as in cleanUpPartFiles
             }
@@ -649,7 +716,11 @@ public class JFiltraServer {
             if (!onNameConflict.equals("append") && destinationFile.exists()) {
                 boolean identical = existingFileMatches(destinationFile, fileHash);
                 if (identical || onNameConflict.equals("reject")) {
-                    new LimitedInputStream(dis, fileSize).skipRemaining();
+                    String receivedHash = receiveFile(dis, fileSize, encryptionKey, null);
+                    if (!hashesMatch(receivedHash, fileHash)) {
+                        dos.writeUTF("ERROR: Hash verification failed");
+                        return;
+                    }
                     respondToNameConflict(dos, identical, destinationFile, clientLabel);
                     return;
                 }
@@ -719,8 +790,11 @@ public class JFiltraServer {
                 // Connection already broken - nothing more to report
             }
         } catch (Exception e) {
-            // Log any errors during client handling
-            logger.error("Error handling client: " + e.getMessage(), e);
+            if (e instanceof EOFException || e instanceof SocketTimeoutException || e instanceof SocketException) {
+                logger.warn("Client connection ended: " + e);
+            } else {
+                logger.error("Error handling client: " + e.getMessage(), e);
+            }
             
             // Tell the client the transfer failed, if the connection is still usable.
             // Details stay in the server log, since the client is not authenticated.
@@ -759,7 +833,7 @@ public class JFiltraServer {
      * @param dis The stream to read the client's data from
      * @param byteCount Number of (compressed, encrypted) bytes the client announced
      * @param encryptionKey The client's encryption key
-     * @param target The file to write the original content to; must not exist yet
+     * @param target The file to write the original content to; must not exist yet, or null to discard
      * @return SHA-256 hash of the received original content
      * @throws IOException If receiving fails, the data is invalid, or the size limit is exceeded
      * @throws GeneralSecurityException If the cipher cannot be set up
@@ -780,7 +854,10 @@ public class JFiltraServer {
         
         try (InputStream gzis = new GZIPInputStream(new CipherInputStream(body, cipher), 8192);
              OutputStream out = new DigestOutputStream(
-                     new BufferedOutputStream(Files.newOutputStream(target, StandardOpenOption.CREATE_NEW)), digest)) {
+                     target == null ? new OutputStream() {
+                         @Override public void write(int b) { }
+                         @Override public void write(byte[] b, int off, int len) { }
+                     } : new BufferedOutputStream(Files.newOutputStream(target, StandardOpenOption.CREATE_NEW)), digest)) {
 
             // Decompress data in chunks, stopping if the output exceeds the size limit
             byte[] buffer = new byte[8192];

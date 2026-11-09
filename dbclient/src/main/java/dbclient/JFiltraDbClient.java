@@ -52,7 +52,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraDbClient {
 
-    private static final String VERSION = "1.1.7";
+    private static final String VERSION = "1.1.8";
 
     private static final Logger logger = LogManager.getLogger(JFiltraDbClient.class);
 
@@ -504,7 +504,7 @@ public class JFiltraDbClient {
      * e.g. sslpassword=, trustStorePassword=, keyPassword=, db_password=,
      * oracle.jdbc.password= (B1). A value is {brace-quoted} (SQL Server / ODBC: may contain
      * ; and }} for }), "double-quoted" or 'single-quoted' only when the closing quote is
-     * at the end or followed by &amp;, whitespace, or ) in a (key=...) form (C1b: otherwise
+     * at the end or followed by &amp;, ;, whitespace, or ) in a (key=...) form (C1b: otherwise
      * e.g. "Wq8"Er5 is masked as one unquoted value), or runs up to the next &amp; or
      * whitespace, and also up to ) when the character before the keyword is ( (MySQL
      * address=; C1b/C1c: ; is part of the value, and spaces end it so multi-line errors
@@ -515,6 +515,10 @@ public class JFiltraDbClient {
      * @return [start, end) of each value, in order
      */
     static List<int[]> passwordValues(String s) {
+        return passwordValues(s, false);
+    }
+
+    private static List<int[]> passwordValues(String s, boolean jdbcUrl) {
         List<int[]> found = new ArrayList<>();
         int n = s.length();
         Closer braces = new Closer(s, '}');
@@ -558,6 +562,7 @@ public class JFiltraDbClient {
                     if (closed >= 0) {
                         boolean okAfter = closed >= n
                                 || s.charAt(closed) == '&'
+                                || s.charAt(closed) == ';'
                                 || isRegexSpace(s.charAt(closed))
                                 || (parenForm && s.charAt(closed) == ')');
                         if (okAfter) {
@@ -570,11 +575,11 @@ public class JFiltraDbClient {
                 }
             }
             if (end < 0) {
-                // Not quoted (or not a clean quote): up to & or whitespace; also ) in (key=)
+                // Diagnostic text ends at whitespace; JDBC URL secrets include spaces up to & or ).
                 end = valueStart;
                 while (end < n) {
                     char ch = s.charAt(end);
-                    if (ch == '&' || isRegexSpace(ch) || (parenForm && ch == ')')) {
+                    if (ch == '&' || (!jdbcUrl && isRegexSpace(ch)) || ((jdbcUrl || parenForm) && ch == ')')) {
                         break;
                     }
                     end++;
@@ -654,7 +659,7 @@ public class JFiltraDbClient {
                 found.add(m.group(1));
             }
         }
-        for (int[] v : passwordValues(url)) {
+        for (int[] v : passwordValues(url, true)) {
             String value = url.substring(v[0], v[1]);
             found.add(value);
             if (value.length() > 2 && value.startsWith("{") && value.endsWith("}")) {
@@ -680,13 +685,17 @@ public class JFiltraDbClient {
     /** {@link #safe(Object)} with the given secrets. Never throws. */
     static String safe(Object text, List<String> secrets) {
         try {
-            String s = mask(String.valueOf(text));
-            for (String secret : secrets) {
+            // Remove whole known values before structural masking can cut off a spaced
+            // password's prefix. Longest first also handles overlapping passwords.
+            String s = String.valueOf(text);
+            List<String> ordered = new ArrayList<>(secrets);
+            ordered.sort((a, b) -> Integer.compare(b == null ? 0 : b.length(), a == null ? 0 : a.length()));
+            for (String secret : ordered) {
                 if (secret != null && secret.length() >= 4) {
                     s = replaceLiteral(s, secret, "****");
                 }
             }
-            return s;
+            return mask(s);
         } catch (Throwable e) {
             // Never lose the error being logged because masking failed (A1): keep its class only
             return text instanceof Throwable ? text.getClass().getName() + ": " + MASKING_FAILED : MASKING_FAILED;

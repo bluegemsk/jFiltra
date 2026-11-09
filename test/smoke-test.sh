@@ -102,6 +102,20 @@ else
   check "on.name.conflict unit tests compile" false
 fi
 
+check "Java version scripts (32 normal, EA, build-suffix and invalid cases)" bash "$ROOT/test/java-version-test.sh"
+
+# Isolated server with a fault-injecting ServerSocket, no OS resource exhaustion needed.
+if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/server/lib/*" -d "$WORK/unit" "$ROOT/test/ServerConnectionTest.java" 2>/dev/null; then
+  printf 'server.port=%s\nsocket.timeout.seconds=1\n' "$((PORT + 8))" > "$WORK/connection.properties"
+  (cd "$WORK" && "$JAVA" -Dlog4j2.configurationFile="$ROOT/server/config/log4j2.properties" -cp "$WORK/unit:$ROOT/server/lib/*" server.ServerConnectionTest "$WORK/connection.properties" > connection.log 2>&1)
+  check "accept failure recovers and shutdown terminates" [ "$?" = 0 ]
+  check "accept error is one line, not a startup failure" grep -q 'Error accepting connection:.*injected transient accept failure' "$WORK/connection.log"
+  check "EOF and timeout logged without stack traces" bash -c '! grep -Eq "Error handling client|Error starting server|^[[:space:]]+at " "$1"' _ "$WORK/connection.log"
+  check "connect-and-close is not logged at info level" [ "$(count 'Client connected:' "$WORK/connection.log")" = 3 ]
+else
+  check "connection regression tests compile" false
+fi
+
 echo "Build checks"
 check "server JAR runs on Java 8 (class version 52)" [ "$(class_version "$ROOT/server/lib/jfiltra-server.jar")" = "52" ]
 check "client JAR runs on Java 8 (class version 52)" [ "$(class_version "$ROOT/client/lib/jfiltra-client.jar")" = "52" ]
@@ -195,6 +209,24 @@ echo 'filemask=sub/*.csv' >> "$WORK/client-badmask/config/client.properties"
 badmask_exit=$?
 check "invalid filemask refused at startup" [ "$badmask_exit" -eq 1 ]
 check "invalid filemask message names the mask" grep -q "Invalid filemask 'sub/\*.csv'" "$WORK/client-badmask/console.log"
+
+# Raw backslashes must be caught before Properties.load silently removes them.
+for mask in 'sub\*.csv' 'sub\\*.csv'; do
+  cp -R "$WORK/client4" "$WORK/client-rawmask"
+  printf 'filemask=%s\n' "$mask" >> "$WORK/client-rawmask/config/client.properties"
+  (cd "$WORK/client-rawmask" && "$JAVA" -cp "lib/*" client.JFiltraClient config/client.properties > console.log 2>&1)
+  check "raw backslash filemask rejected ($mask)" [ "$?" = 1 ]
+  check "raw backslash error names filemask" grep -q 'Setting filemask must not contain a backslash' "$WORK/client-rawmask/console.log"
+  rm -rf "$WORK/client-rawmask"
+done
+for pattern in '[abc' '{a,b}'; do
+  cp -R "$WORK/client4" "$WORK/client-badignore"
+  printf 'ignore.patterns=%s\n' "$pattern" >> "$WORK/client-badignore/config/client.properties"
+  (cd "$WORK/client-badignore" && "$JAVA" -cp "lib/*" client.JFiltraClient config/client.properties > console.log 2>&1)
+  check "invalid ignore.patterns rejected ($pattern)" [ "$?" = 1 ]
+  check "invalid ignore.patterns message names setting and pattern" grep -q 'Setting ignore.patterns has an invalid pattern' "$WORK/client-badignore/console.log"
+  rm -rf "$WORK/client-badignore"
+done
 
 # Files present before the clients start
 echo "a,b" > "$WORK/src4/data.csv"
@@ -314,6 +346,51 @@ code="$(run_once name)"
 check "invalid run.mode exits with 1" [ "$code" = 1 ]
 check "invalid run.mode message names the values" grep -q "run.mode must be loop or once, but is: twice" "$C5/once.log"
 sed -i 's/^run.mode=.*/run.mode=once/' "$C5/config/client.properties"
+
+echo "1.1.8 per-file failure, conflict validation and mapping reloads"
+rm -rf "$WORK/src5" "$WORK/received/client5/a.txt" "$WORK/received/client5/b.txt" && mkdir -p "$WORK/src5" "$WORK/received/client5/a.txt"
+echo blocked > "$WORK/src5/a.txt"; echo next > "$WORK/src5/b.txt"
+code="$(run_once name)"
+check "once: retryable first-file rejection does not block next file" [ "$code" = 0 -a -f "$WORK/src5/a.txt" -a ! -e "$WORK/src5/b.txt" ]
+code="$(run_once name)"
+check "once: all attempted files fail: exit 3" [ "$code" = 3 ]
+rm -rf "$WORK/received/client5/a.txt"
+cp "$WORK/src5/a.txt" "$WORK/received/client5/a.txt"
+sed -i "s|^encryption.key=.*|encryption.key=$WRONG_KEY|" "$C5/config/client.properties"
+code="$(run_once name)"
+check "identical conflict with wrong key: exit 3, not SUCCESS" [ "$code" = 3 -a -f "$WORK/src5/a.txt" ]
+check "identical conflict with wrong key reports Decryption failed" grep -q 'ERROR: Decryption failed' "$C5/once.log"
+echo different > "$WORK/src5/a.txt"
+code="$(run_once name)"
+check "reject conflict with wrong key reports Decryption failed" grep -q 'ERROR: Decryption failed' "$C5/once.log"
+sed -i "s|^encryption.key=.*|encryption.key=$KEY5|" "$C5/config/client.properties"
+rm -f "$WORK/src5/a.txt"
+# Rotate one key, then corrupt the file: the new valid key must stay active.
+cp "$WORK/server/config/client_keys.properties" "$WORK/keys.saved"
+KEY5_NEW="$(random_key)"
+sed -i "s|^client5=.*|client5=$KEY5_NEW|" "$WORK/server/config/client_keys.properties"
+sed -i "s|^encryption.key=.*|encryption.key=$KEY5_NEW|" "$C5/config/client.properties"
+echo rotated > "$WORK/src5/rotated.txt"
+code="$(run_once name)"
+check "key reload works without restart" [ "$code" = 0 -a -f "$WORK/received/client5/rotated.txt" ]
+printf 'client5=\\uZZZZ\n' > "$WORK/server/config/client_keys.properties"
+echo retained > "$WORK/src5/retained.txt"
+code="$(run_once name)"
+check "malformed key reload keeps last good key" [ "$code" = 0 -a -f "$WORK/received/client5/retained.txt" ]
+check "malformed key reload logged" grep -q 'Cannot reload client.keys.path; keeping last good configuration' "$SERVER_LOG"
+cp "$WORK/keys.saved" "$WORK/server/config/client_keys.properties"
+sed -i "s|^encryption.key=.*|encryption.key=$KEY5|" "$C5/config/client.properties"
+cp "$WORK/server/config/client_paths.properties" "$WORK/paths.saved"
+sed -i "s|^client5=.*|client5=$WORK/reloaded5|" "$WORK/server/config/client_paths.properties"
+echo redirected > "$WORK/src5/redirected.txt"
+code="$(run_once name)"
+check "path reload works without restart" [ "$code" = 0 -a -f "$WORK/reloaded5/redirected.txt" ]
+printf 'client5=\\uZZZZ\n' > "$WORK/server/config/client_paths.properties"
+echo retained > "$WORK/src5/path-retained.txt"
+code="$(run_once name)"
+check "malformed path reload keeps last good path" [ "$code" = 0 -a -f "$WORK/reloaded5/path-retained.txt" ]
+check "malformed path reload logged" grep -q 'Cannot reload client.paths.config; keeping last good configuration' "$SERVER_LOG"
+cp "$WORK/paths.saved" "$WORK/server/config/client_paths.properties"
 
 echo "after.send=move"
 check "delete is the default after.send" grep -q "After Send: delete" "$CLIENT_LOG"

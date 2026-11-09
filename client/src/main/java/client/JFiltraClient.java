@@ -41,7 +41,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraClient {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.1.7";
+    private static final String VERSION = "1.1.8";
     
     // Initialize logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraClient.class);
@@ -66,7 +66,6 @@ public class JFiltraClient {
     private String fileOrder;                   // file.order: time, size or name, ! reverses
     private Comparator<Candidate> fileComparator; // Order in which files are sent
     private boolean lastFileSent;               // Whether the last processFile call succeeded
-    private boolean lastPermanentRejection;     // Whether the server last rejected a file for good
 
     // Files delivered whose deletion failed, with their snapshot: only the delete is retried,
     // never the transfer (a resend would append or store the file again)
@@ -210,7 +209,11 @@ public class JFiltraClient {
             for (String pattern : ignorePatterns.split(",")) {
                 if (!pattern.trim().isEmpty()) {
                     // Lower case on both sides: not case-sensitive on any system, like filemask
-                    ignoreMatchers.add(FileSystems.getDefault().getPathMatcher("glob:" + pattern.trim().toLowerCase(Locale.ROOT)));
+                    try {
+                        ignoreMatchers.add(FileSystems.getDefault().getPathMatcher("glob:" + pattern.trim().toLowerCase(Locale.ROOT)));
+                    } catch (IllegalArgumentException e) {
+                        throw new IllegalArgumentException("Setting ignore.patterns has an invalid pattern '" + pattern.trim() + "'");
+                    }
                 }
             }
 
@@ -279,6 +282,12 @@ public class JFiltraClient {
             text = text.substring(1);
         }
         
+        // Properties.load removes backslashes, so reject them in the raw value first.
+        for (String line : text.split("\\r\\n|\\r|\\n")) {
+            if (line.matches("\\s*filemask(?:\\s*[:=]|\\s+).*") && line.indexOf('\\') >= 0) {
+                throw new IllegalArgumentException("Setting filemask must not contain a backslash");
+            }
+        }
         Properties props = new Properties();
         props.load(new StringReader(text));
         return props;
@@ -529,8 +538,8 @@ public class JFiltraClient {
     }
 
     /**
-     * run.mode=once: scans the source directories once, sends the first file in
-     * file.order and returns. A file that changes during a short check (1 second) is
+     * run.mode=once: scans the source directories once, tries files in file.order
+     * until one succeeds, and returns. A file that changes during a short check (1 second) is
      * still being written and is skipped. There is one attempt, no retries.
      *
      * @return The exit code: EXIT_SENT, EXIT_NOTHING_TO_SEND or EXIT_TRANSFER_FAILED
@@ -554,11 +563,16 @@ public class JFiltraClient {
             
             // Files still being written change within a second; skip them
             Thread.sleep(1000);
+            boolean attempted = false;
             for (Candidate candidate : candidates) {
                 String snapshot;
                 try {
                     snapshot = fileSnapshot(candidate.path);
                 } catch (NoSuchFileException e) {
+                    continue;
+                } catch (IOException e) {
+                    attempted = true;
+                    logger.error("Cannot inspect file " + candidate.name + ": " + e);
                     continue;
                 }
                 if (!snapshot.equals(candidate.size + ":" + candidate.modified)) {
@@ -566,17 +580,19 @@ public class JFiltraClient {
                     continue;
                 }
                 logger.info("Sending one file (file.order=" + fileOrder + "): " + candidate.name);
+                attempted = true;
                 lastFileSent = false;
-                lastPermanentRejection = false;
                 processFile(candidate.path, snapshot);
-                if (lastPermanentRejection) {
-                    // Would be rejected on every run: try the next file instead
-                    continue;
+                if (lastFileSent) {
+                    return EXIT_SENT;
                 }
-                return lastFileSent ? EXIT_SENT : EXIT_TRANSFER_FAILED;
+                if (serverRetryAt != 0) {
+                    return EXIT_TRANSFER_FAILED; // Unreachable server: stop immediately.
+                }
+                // Per-file failure: try the next candidate in this same run.
             }
-            logger.info("No file to send (no file can be sent now: still being written or always rejected)");
-            return EXIT_NOTHING_TO_SEND;
+            logger.info("No file sent (files are still being written or transfers failed)");
+            return attempted ? EXIT_TRANSFER_FAILED : EXIT_NOTHING_TO_SEND;
         } catch (Exception e) {
             logger.error("Error in one-time run: " + e, e);
             return EXIT_TRANSFER_FAILED;
@@ -831,7 +847,6 @@ public class JFiltraClient {
                 retries.remove(filePath);
                 lastFileSent = finishDelivered(filePath, snapshot);
             } else if (PERMANENT_REJECTIONS.contains(response)) {
-                lastPermanentRejection = true;
                 // Don't resend a file the server will always reject; it is tried again once it changes
                 rejectedFiles.put(filePath, snapshot);
                 logger.error("File " + fileName + " will not be sent again until it changes");

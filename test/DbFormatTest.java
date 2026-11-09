@@ -146,16 +146,29 @@ public class DbFormatTest {
         eq(JFiltraDbClient.urlPasswords("jdbc:mysql://address=(host=h)(user=pwt)(password=Ab,cd9XyZ)/test").toString(), "[Ab,cd9XyZ]");
         for (String pw : new String[] {"Ab,cd9", "Ab'cd9", "Ab\"cd9", "Ab;cd9XyZ", "Rt)yu1Op"}) {
             eq(JFiltraDbClient.mask("jdbc:x://h/db?user=a&password=" + pw + "&ssl=1"), "jdbc:x://h/db?user=a&password=****&ssl=1");
-            eq(JFiltraDbClient.urlPasswords("jdbc:x://h/db?password=" + pw + "&ssl=1").toString(), "[" + pw + "]");
+            eq(JFiltraDbClient.urlPasswords("jdbc:x://h/db?password=" + pw + "&ssl=1").toString(), "[" + (pw.contains(")") ? pw.substring(0, pw.indexOf(')')) : pw) + "]");
         }
         // ) ends the value only in (key=...) form; passwords with ) belong in URL parameters
         for (String pw : new String[] {"Ab,cd9", "Ab'cd9", "Ab\"cd9", "Ab;cd9"}) {
             eq(JFiltraDbClient.mask("(user=a)(password=" + pw + ")/db"), "(user=a)(password=****)/db");
         }
         eq(JFiltraDbClient.mask("(user=a)(password=Rt)yu1Op)/db"), "(user=a)(password=****)yu1Op)/db");
-        // Space in the value ends it (C1c)
-        eq(JFiltraDbClient.urlPasswords("jdbc:x://h;password=Ab,c d;db=x").toString(), "[Ab,c]");
+        // JDBC URL secrets include spaces; diagnostic masking still ends at whitespace.
+        eq(JFiltraDbClient.urlPasswords("jdbc:x://h;password=Ab,c d;db=x").toString(), "[Ab,c d;db=x]");
         eq(JFiltraDbClient.urlPasswords("jdbc:x://h/db?password=Ab,c%20d&ssl=1").toString(), "[Ab,c%20d]");
+        eq(JFiltraDbClient.mask("password=\"quoted secret\";db=x"), "password=****;db=x");
+        eq(JFiltraDbClient.mask("password='quoted secret';db=x"), "password=****;db=x");
+        eq(JFiltraDbClient.urlPasswords("jdbc:x://h?password=two words&x=1").toString(), "[two words]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:x://(password=two words)/db").toString(), "[two words]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:x://h;password=\"quoted secret\";db=x").toString(), "[\"quoted secret\", quoted secret]");
+        eq(JFiltraDbClient.safe("Driver rejected 'two words'", JFiltraDbClient.urlPasswords("jdbc:x://h?password=two words&x=1")),
+                "Driver rejected '****'");
+        eq(JFiltraDbClient.safe("Driver rejected 'quoted secret'", JFiltraDbClient.urlPasswords("jdbc:x://h;password=\"quoted secret\";db=x")),
+                "Driver rejected '****'");
+        eq(JFiltraDbClient.safe("Driver error: password=two words&x=1", JFiltraDbClient.urlPasswords("jdbc:x://h?password=two words&x=1")),
+                "Driver error: password=****&x=1");
+        eq(JFiltraDbClient.safe("Driver error: password=two words&x=1", java.util.Arrays.asList("two ", "two words")),
+                "Driver error: password=****&x=1");
         // Partial quote then more text: whole value masked (C1b)
         eq(JFiltraDbClient.mask("jdbc:x://h/db?password=\"Wq8\"Er5&ssl=1"), "jdbc:x://h/db?password=****&ssl=1");
         eq(JFiltraDbClient.mask("jdbc:x://h/db?password='Fg6'Hj7&ssl=1"), "jdbc:x://h/db?password=****&ssl=1");

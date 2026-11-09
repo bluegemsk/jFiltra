@@ -2,7 +2,7 @@
 
 jFiltra is a lightweight Java client/server tool for moving files from watched
 directories to a central server, reliably and with as little setup as possible.
-Current version: **1.1.7** (server, client and DB client share the version).
+Current version: **1.1.8** (server, client and DB client share the version).
 
 - The **client** polls one or more source directories. For each file it computes a
   SHA-256 hash, compresses the file with GZIP, scrambles it with AES using a
@@ -164,6 +164,9 @@ also still work.
 `<client.label>=<storage directory>`. Files from a client without an entry are
 stored in `server/incoming/`. The storage directory is created if it doesn't exist.
 
+Client key and storage-path mappings are reloaded per connection when their file
+modification time changes. Invalid updates are logged; the last good copy stays active.
+
 ### Client
 
 `client/config/client.properties`
@@ -183,6 +186,9 @@ stored in `server/incoming/`. The storage directory is created if it doesn't exi
 | `after.send`               | No       | What happens to a file after the server stored it: `delete` (default) or `move` to `sent/` inside its source directory. See [How transfers behave](#how-transfers-behave) |
 | `filemask`                 | No       | File name masks of the files to send, separated by `,` or `;` (default `*`: all files). See [File mask](#file-mask) |
 | `ignore.patterns`          | No       | Comma-separated file name patterns that are never sent, not case-sensitive (default `.*,*.part,*.tmp,*.crdownload,~$*`; empty sends everything) |
+
+`ignore.patterns` is split on every comma, including the comma in `{a,b}`;
+brace alternatives containing commas are not supported. Use separate patterns instead.
 
 ### File mask
 
@@ -228,7 +234,7 @@ filemask=*.csv; report_??.txt
 
 With `run.mode=once` the client does not keep running. It scans the source
 directories once, applies `filemask` and `ignore.patterns`, orders the files by
-`file.order`, sends **only the first file**, and exits. Use it from cron, a
+`file.order`, sends **at most one file successfully**, and exits. Use it from cron, a
 scheduler or a script, for example to send the oldest waiting file every minute:
 
 ```properties
@@ -243,11 +249,11 @@ client/script/start-client.sh; echo "exit code $?"
 - Before sending, the client waits 1 second and skips files that changed in that
   time (still being written); then the next file in order is sent.
   `stable.polls` and `polling.interval.seconds` are not used in this mode.
-- There is one attempt and no retries. A file that was not sent stays in the
+- There is one attempt per file and no retries. A file that was not sent stays in the
   source directory and is tried again by the next run.
-- A file the server rejects for good (`File too large`, `Invalid file name`) is
-  skipped, and the next file in order is sent in the same run, so one such file
-  can't block every run.
+- A per-file failure is skipped and the next file in order is tried in the same
+  run. An unreachable server stops the run immediately. If all attempted files
+  fail, the exit code is 3.
 - The value is not case-sensitive. An invalid `run.mode` or `file.order` stops
   the client with exit code 1.
 
@@ -257,7 +263,7 @@ Exit codes (in both modes, 1 also means a configuration error at startup):
 |------|---------|
 | `0`  | The file was sent and removed from the source directory (deleted, or moved to `sent/`) |
 | `1`  | Configuration error (missing or invalid setting, missing config file) |
-| `2`  | Nothing to send: no matching file, or every file is still being written or rejected for good |
+| `2`  | Nothing to send: no matching file, or every file is still being written |
 | `3`  | Transfer failed: server not reachable, file rejected by the server, file not readable, or sent but not deletable or movable |
 
 ### Keys
