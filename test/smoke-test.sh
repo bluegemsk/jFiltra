@@ -123,6 +123,13 @@ if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/client/lib/*" -d "$WORK/unit"
 else
   check "cleanup permission-race tests compile" false
 fi
+if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/server/lib/*:$ROOT/client/lib/*" -d "$WORK/unit" "$ROOT/test/HashGrowthTest.java" 2>/dev/null; then
+  "$JAVA" -Dlog4j2.configurationFile="$ROOT/server/config/log4j2.properties" -cp "$WORK/unit:$ROOT/server/lib/*:$ROOT/client/lib/*" client.HashGrowthTest "$WORK/hash-growth" "$((PORT + 7))" > "$WORK/hash-growth.log" 2>&1
+  check "hash-pass growth: delete/move, append storage receives one copy and no resend" [ "$?" = 0 ]
+  check "hash-pass growth: sent logs use the size after hashing" [ "$(count 'File sent: grow.bin (32773 bytes' "$WORK/hash-growth.log")" = 2 ]
+else
+  check "hash-pass growth regression tests compile" false
+fi
 if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/server/lib/*" -d "$WORK/unit" "$ROOT/test/ServerReloadTest.java" 2>/dev/null; then
   "$JAVA" -Dlog4j2.configurationFile="$ROOT/server/config/log4j2.properties" -cp "$WORK/unit:$ROOT/server/lib/*" server.ServerReloadTest "$WORK/reload-test" > "$WORK/reload-test.log" 2>&1
   check "reload detects size and unsettled/two-step writes" [ "$?" = 0 ]
@@ -133,6 +140,9 @@ if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/server/lib/*" -d "$WORK/unit"
   check "future startup mtime causes no repeated Reloaded lines" [ "$(awk '/FUTURE_STARTUP_BEGIN/{active=1;next} /FUTURE_STARTUP_END/{active=0} active && /Reloaded /{n++} END{print n+0}' "$WORK/reload-test.log")" = 0 ]
   check "keys revert logs valid again exactly once" [ "$(awk '/KEYS_RECOVERY_BEGIN/{active=1;next} /KEYS_RECOVERY_END/{active=0} active && /client.keys.path is valid again/{n++} END{print n+0}' "$WORK/reload-test.log")" = 1 ]
   check "paths revert logs valid again exactly once" [ "$(awk '/PATHS_RECOVERY_BEGIN/{active=1;next} /PATHS_RECOVERY_END/{active=0} active && /client.paths.config is valid again/{n++} END{print n+0}' "$WORK/reload-test.log")" = 1 ]
+  check "invalid keys: 50 reloads log one error" [ "$(awk '/KEYS_RECOVERY_BEGIN/{active=1;next} /KEYS_RECOVERY_END/{active=0} active && /Cannot reload client.keys.path/{n++} END{print n+0}' "$WORK/reload-test.log")" = 1 ]
+  check "invalid paths: 50 reloads log one error" [ "$(awk '/PATHS_RECOVERY_BEGIN/{active=1;next} /PATHS_RECOVERY_END/{active=0} active && /Cannot reload client.paths.config/{n++} END{print n+0}' "$WORK/reload-test.log")" = 1 ]
+  check "invalid keys: changed mtime or size logs once per version" [ "$(awk '/KEYS_NEW_VERSION_BEGIN/{active=1;next} /KEYS_NEW_VERSION_END/{active=0} active && /Cannot reload client.keys.path/{n++} END{print n+0}' "$WORK/reload-test.log")" = 3 ]
   check "reverting to active content adds no Reloaded lines" [ "$(awk '/KEYS_RECOVERY_BEGIN|PATHS_RECOVERY_BEGIN/{active=1;next} /KEYS_RECOVERY_END|PATHS_RECOVERY_END/{active=0} active && /Reloaded /{n++} END{print n+0}' "$WORK/reload-test.log")" = 0 ]
 else
   check "reload regression tests compile" false
@@ -362,6 +372,24 @@ check "sent file delivered with the same content" cmp -s "$WORK/received/client5
 rm -rf "$WORK/src5" && mkdir -p "$WORK/src5"
 code="$(run_once name)"
 check "once with an empty outbox exits with 2" [ "$code" = 2 ]
+# No usable source is a failure; a usable but empty source is still exit 2.
+for kind in missing regular unreadable; do
+  source="$WORK/once-$kind"
+  [ "$kind" = regular ] && echo file > "$source"
+  if [ "$kind" = unreadable ]; then mkdir "$source"; chmod 000 "$source"; fi
+  sed -i "s|^source.directories=.*|source.directories=$source|" "$C5/config/client.properties"
+  code="$(run_once name)"
+  check "once: $kind source exits 3" [ "$code" = 3 ]
+  if [ "$kind" = regular ]; then
+    check "once: regular source says not a directory" grep -q 'is not a directory:' "$C5/once.log"
+  fi
+  [ "$kind" = unreadable ] && chmod 755 "$source"
+done
+sed -i "s|^source.directories=.*|source.directories=$WORK/once-missing,$WORK/src5|" "$C5/config/client.properties"
+code="$(run_once name)"
+check "once: readable empty source alongside missing source exits 2" [ "$code" = 2 ]
+sed -i "s|^source.directories=.*|source.directories=$WORK/src5|" "$C5/config/client.properties"
+
 make_outbox
 sed -i "s/^server.port=.*/server.port=$((PORT + 9))/" "$C5/config/client.properties"
 code="$(run_once name)"
@@ -410,6 +438,8 @@ echo retained > "$WORK/src5/retained.txt"
 code="$(run_once name)"
 check "malformed key reload keeps last good key" [ "$code" = 0 -a -f "$WORK/received/client5/retained.txt" ]
 check "malformed key reload logged" grep -q 'Cannot reload client.keys.path; keeping last good configuration' "$SERVER_LOG"
+check "invalid mapping: 50 connection probes complete" "$JAVA" -cp "$WORK/unit:$ROOT/server/lib/*" server.ServerReloadTest --probe "$PORT"
+check "invalid mapping: 50 connections leave only one reload error" [ "$(count 'Cannot reload client.keys.path; keeping last good configuration' "$SERVER_LOG")" = 1 ]
 cp "$WORK/keys.saved" "$WORK/server/config/client_keys.properties"
 sed -i "s|^encryption.key=.*|encryption.key=$KEY5|" "$C5/config/client.properties"
 cp "$WORK/server/config/client_paths.properties" "$WORK/paths.saved"
@@ -541,6 +571,15 @@ check "directory name reported clearly" grep -q "a directory or other non-file h
 check "negative size rejected" "$JAVA" -cp "$WORK/unit" ParallelSendTest "$MODE_PORT" parallel "$KEYP" x expect -5 "ERROR: File too large"
 check "negative size logged as invalid" grep -q "invalid size -5" "$MODE_LOG"
 
+rm -rf "$WORK/received/parallel/parallel.csv"
+# An unwritable storage directory must yield a short contextual error, no trace/part file.
+chmod 555 "$WORK/received/parallel"
+check "read-only storage returns Transfer failed" "$JAVA" -cp "$WORK/unit" ParallelSendTest "$MODE_PORT" parallel "$KEYP" x expect 0 "ERROR: Transfer failed"
+chmod 755 "$WORK/received/parallel"
+check "read-only storage has one contextual error line" [ "$(count 'Transfer of file parallel.csv from client parallel failed: cannot write to storage directory: AccessDeniedException' "$MODE_LOG")" = 1 ]
+check "read-only storage has no stack trace" bash -c '! grep -Eq "Error handling client|^[[:space:]]+at " "$1"' _ "$MODE_LOG"
+check "read-only storage leaves no part files" bash -c '! compgen -G "$1/.jfiltra-*.part" >/dev/null' _ "$WORK/received/parallel"
+
 echo "Append with a source file that can't be deleted"
 rm -rf "$WORK/received/parallel" && mkdir -p "$WORK/received/parallel" "$WORK/src6"
 printf 'parallel=%s\n' "$WORK/received/parallel" > "$WORK/server-mode/config/client_paths.properties"
@@ -569,6 +608,16 @@ for action in delete move; do
   (cd "$WORK/client6" && "$JAVA" -cp 'lib/*' client.JFiltraClient config/client.properties > "restored-$action.log" 2>&1)
   check "$action: once succeeds after permissions restored" [ "$?" = 0 ]
   check "$action: appended exactly once across four runs" cmp -s "$WORK/received/parallel/$action.txt" <(echo "$action content")
+done
+# O1: an archive target that is a directory must be detected before append delivery.
+rm -rf "$WORK/src6" && mkdir -p "$WORK/src6/sent/archive-dir.txt"
+echo payload > "$WORK/src6/archive-dir.txt"
+write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+printf 'run.mode=once\nafter.send=move\nfile.order=name\n' >> "$WORK/client6/config/client.properties"
+for attempt in 1 2 3; do
+  (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile="$WORK/client6/config/log4j2.properties" -cp 'lib/*' client.JFiltraClient config/client.properties > "archive-dir-$attempt.log" 2>&1)
+  check "move/archive target directory: run $attempt exits 3 without append" [ "$?" = 3 -a ! -e "$WORK/received/parallel/archive-dir.txt" -a -f "$WORK/src6/archive-dir.txt" ]
+  check "move/archive target directory: run $attempt logs pre-check error" [ "$(count 'ERROR.*Cannot send archive-dir.txt: archive target is a directory:' "$WORK/client6/archive-dir-$attempt.log")" = 1 ]
 done
 # G1: a writable sent/ does not compensate for a read-only source directory.
 rm -rf "$WORK/src6" && mkdir -p "$WORK/src6/sent"

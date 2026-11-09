@@ -2,20 +2,28 @@
 
 jFiltra is a lightweight Java client/server tool for moving files from watched
 directories to a central server, reliably and with as little setup as possible.
-Current version: **1.1.8** (server, client and DB client share the version).
+Current version: **1.1.9** (server, client and DB client share the version).
 
 ## Status
 
-1.1.8 (November 2026) is the current stable version. It has passed
-four rounds of testing with no open bugs:
+1.1.9 (November 2026) addresses the findings from the 1.1.8 product test.
+No known open bugs remain in the tested scenarios:
 
-- Bundled suites pass on Temurin 21.0.13 and Temurin 1.8.0_512: the file client and server smoke test
-  (185 checks), the DB client smoke test against PostgreSQL 17.11 and MariaDB 11.4.13
-  (with the PostgreSQL, MariaDB and MySQL Connector/J drivers), and the Java
-  version script test (48 cases).
-- Long run on Java 8: 300 files from two source directories with `after.send=move`,
+- Bundled suites pass on Temurin 21.0.12.1 and Temurin 1.8.0_504: the file client and server smoke test
+  (207 checks; run twice on Java 8), the DB client smoke test against PostgreSQL
+  (131 checks) and MariaDB (122 with the MariaDB driver, 125 with MySQL Connector/J,
+  and 122 with Connector/J cursor fetching), and the Java version script test
+  (48 cases, included in each file smoke run).
+- Earlier product test on Java 8: 300 files from two source directories with `after.send=move`,
   port probes and a key file change during the run. All files arrived intact, with
   no warnings or errors.
+- Changes in 1.1.9:
+  - A file that grows during hashing is removed or archived after successful delivery
+    if unchanged since the hash pass, avoiding duplicate append deliveries.
+  - Storage filesystem errors are logged on one line, without stack traces.
+  - An archive target that is a directory is detected before uploading.
+  - A one-time run with no readable source directory exits 3, with clearer path errors.
+  - Invalid mapping edits are logged once per file version; recovery is still logged once.
 - Changes in 1.1.8:
   - The server keeps running when accepting a connection fails, and logs ordinary
     network events on one line without stack traces.
@@ -195,8 +203,8 @@ modification time or size changes. Recently modified files are rechecked on each
 connection until unchanged for 2 seconds; future mtimes are treated as settled.
 `Reloaded` is logged only when the parsed content changes. After a reload error,
 the first successful reload logs `<setting> is valid again`, even when reverting
-to the active content. Invalid updates are logged with the reason;
-the last good copy stays active.
+to the active content. Invalid updates are logged with the reason once per file
+version (modification time and size); the last good copy stays active.
 
 ### Client
 
@@ -288,7 +296,8 @@ client/script/start-client.sh; echo "exit code $?"
   fail, the exit code is 3. Retries are deferred to the next run.
 - Before each send, the source directory must be writable for both `delete` and
   `move`. With `after.send=move`, an existing `sent/` must additionally be a writable
-  directory. A failed pre-check prevents the send and blocks only that source
+  directory, and `sent/<fileName>` must not itself be a directory. A failed
+  pre-check prevents the send and blocks only that source
   directory for the rest of this run; candidates in other directories are still
   tried. Exit 0 if a file succeeds, or 3 if none succeeds and a check/transfer fails.
 - If deletion/moving still fails after delivery (for example permissions change
@@ -304,8 +313,8 @@ Exit codes (in both modes, 1 also means a configuration error at startup):
 |------|---------|
 | `0`  | The file was sent and removed from the source directory (deleted, or moved to `sent/`) |
 | `1`  | Configuration error (missing or invalid setting, missing config file) |
-| `2`  | Nothing to send: no matching file, or every file is still being written |
-| `3`  | Transfer failed: server not reachable, file rejected by the server, file not readable, or sent but not deletable or movable |
+| `2`  | At least one source directory is readable, but there is no matching file or every file is still being written |
+| `3`  | No readable source directory, a failed pre-check, server not reachable, file rejected or unreadable, or sent but not deletable or movable |
 
 ### Keys
 
@@ -423,8 +432,10 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
 - Files matching `ignore.patterns` are never sent (upper and lower case don't matter). By default these are hidden
   files (starting with `.`), files ending in `.part`, `.tmp` or `.crdownload`, and
   Office lock files (starting with `~$`).
-- If a file changes while it is being sent, the client keeps it instead of
-  deleting it, so the new content is not lost.
+- After the hash pass, the client records the file's size and modification time.
+  After successful delivery it deletes or moves the file only if that snapshot
+  still matches; otherwise it keeps it so new content is not lost. Growth during
+  hashing alone does not prevent cleanup or cause the delivered file to be resent.
 - The client deletes a file only after the server replies with success. In all
   other cases the file stays where it is and is retried (see [Retries](#retries)).
 - With `after.send=move` the file is moved instead of deleted, to `sent/` inside
@@ -438,7 +449,8 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
   link to one), no file of that source directory is sent. The client logs
   `Cannot send …: not a writable directory`. Once mode skips the directory and
   exits 3 if no file from another directory succeeds; loop mode retries the check
-  with growing delays.
+  with growing delays. A directory occupying `sent/<fileName>` also prevents the
+  upload, with an `archive target is a directory` error and the same retry rules.
 - When the server rejects a file, the client logs the reason, for example
   `Server rejected file report.pdf: ERROR: File already exists`. The server log
   has the details. A wrong key is reported as `ERROR: Decryption failed`.
@@ -561,7 +573,7 @@ The size limit applies to the data as sent too. Compression can't shrink data
 that is already compressed (such as ZIP files, videos or photos) and makes it
 slightly larger, so such a file just under the limit can be rejected.
 
-As a rough guide, tests on fast hardware reached about 18 to 30 MB/s end to end
+As a rough guide, tests on fast hardware reached about 17 to 30 MB/s end to end
 for data that doesn't compress, and much more for text, which compresses well.
 On a real network, the network speed usually sets the limit.
 

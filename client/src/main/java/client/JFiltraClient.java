@@ -41,7 +41,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraClient {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.1.8";
+    private static final String VERSION = "1.1.9";
     
     // Initialize logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraClient.class);
@@ -397,7 +397,8 @@ public class JFiltraClient {
                     if (!Files.isDirectory(dir)) {
                         // Warn once, not on every poll
                         if (missingDirs.add(dirPath)) {
-                            logger.warn("Directory does not exist: " + dirPath + " (checked again on every poll)");
+                            logger.warn((Files.exists(dir) ? "Source path is not a directory: " : "Directory does not exist: ")
+                                    + dirPath + " (checked again on every poll)");
                         }
                         continue;
                     }
@@ -552,13 +553,23 @@ public class JFiltraClient {
     public int runOnce() {
         try {
             List<Candidate> candidates = new ArrayList<>();
+            boolean readableSource = false;
             for (String dirPath : sourceDirs) {
                 Path dir = Paths.get(dirPath);
                 if (!Files.isDirectory(dir)) {
-                    logger.warn("Directory does not exist: " + dirPath);
+                    logger.warn(Files.exists(dir) ? "Source path is not a directory: " + dirPath
+                            : "Directory does not exist: " + dirPath);
                     continue;
                 }
+                if (!Files.isReadable(dir)) {
+                    logger.warn("Cannot read directory: " + dirPath);
+                    continue;
+                }
+                readableSource = true;
                 candidates.addAll(listCandidates(dir));
+            }
+            if (!readableSource) {
+                return EXIT_TRANSFER_FAILED;
             }
             candidates.sort(fileComparator);
             if (candidates.isEmpty()) {
@@ -826,6 +837,15 @@ public class JFiltraClient {
             if (Files.exists(sentDir, LinkOption.NOFOLLOW_LINKS)) {
                 mustBeWritable.add(sentDir);
             }
+            Path target = sentDir.resolve(fileName);
+            if (Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
+                logger.error("Cannot send " + fileName + ": archive target is a directory: " + target);
+                lastPreCheckFailed = true;
+                if (!runOnce) {
+                    scheduleRetry(filePath, snapshot, fileName);
+                }
+                return;
+            }
         }
         for (Path dir : mustBeWritable) {
             if (!Files.isDirectory(dir) || !Files.isWritable(dir)) {
@@ -844,6 +864,7 @@ public class JFiltraClient {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             CountingOutputStream sizeCounter = new CountingOutputStream(new DiscardingOutputStream());
             writeEncrypted(filePath, sizeCounter, digest);
+            String afterHash = fileSnapshot(filePath);
             String fileHash = toHex(digest.digest());
             
             // Second pass: compress, encrypt and send the file straight to the server
@@ -871,17 +892,17 @@ public class JFiltraClient {
             if ("SUCCESS".equals(response)) {
                 lastRemovalFailed = true; // Cleared only when local cleanup succeeds.
                 double seconds = (System.currentTimeMillis() - startTime) / 1000.0;
-                String size = snapshot.substring(0, snapshot.indexOf(':'));
+                String size = afterHash.substring(0, afterHash.indexOf(':'));
                 logger.info(String.format("File sent: %s (%s bytes, %.2f s, SHA-256 %s)", fileName, size, seconds, fileHash));
                 
                 // Delete (or move to sent/) the original file after successful transfer, unless it
                 // changed while being sent - removing it then would lose the new content
-                if (!snapshot.equals(fileSnapshot(filePath))) {
+                if (!afterHash.equals(fileSnapshot(filePath))) {
                     logger.warn("File changed while being sent and was not " + (moveToSent ? "moved" : "deleted") + ": " + fileName);
                     return;
                 }
                 retries.remove(filePath);
-                lastFileSent = finishDelivered(filePath, snapshot);
+                lastFileSent = finishDelivered(filePath, afterHash);
                 lastRemovalFailed = !lastFileSent;
             } else if (PERMANENT_REJECTIONS.contains(response)) {
                 // Don't resend a file the server will always reject; it is tried again once it changes

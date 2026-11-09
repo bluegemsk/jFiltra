@@ -2,6 +2,7 @@
 package server;
 
 import java.lang.reflect.Method;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.FileTime;
@@ -21,6 +22,17 @@ public class ServerReloadTest {
         if (!expected.equals(actual)) throw new AssertionError("Expected " + expected + " but got " + actual);
     }
     public static void main(String[] args) throws Exception {
+        if (args.length == 2 && args[0].equals("--probe")) {
+            for (int i = 0; i < 50; i++) {
+                try (Socket socket = new Socket("127.0.0.1", Integer.parseInt(args[1]))) {
+                    socket.setSoTimeout(5000);
+                    socket.shutdownOutput();
+                    if (socket.getInputStream().read() != -1)
+                        throw new AssertionError("connect-and-close should receive no data");
+                }
+            }
+            return;
+        }
         Path work = Files.createDirectories(Paths.get(args[0]));
         Path keys = work.resolve("keys.properties"), paths = work.resolve("paths.properties");
         Path config = work.resolve("server.properties");
@@ -93,13 +105,25 @@ public class ServerReloadTest {
         System.out.println("KEYS_RECOVERY_BEGIN");
         FileTime badTime = FileTime.fromMillis(future.toMillis() + 1);
         write(keys, "test=short\n", badTime);
-        for (int i = 0; i < 3; i++) eq(reload(server)[0].getProperty("test"), a);
+        for (int i = 0; i < 50; i++) eq(reload(server)[0].getProperty("test"), a);
         write(keys, "test=" + a + "\n", future);
         for (int i = 0; i < 10; i++) eq(reload(server)[0].getProperty("test"), a);
         System.out.println("KEYS_RECOVERY_END");
+        // Another failed version (same size, new mtime) must get its own one-line error.
+        System.out.println("KEYS_NEW_VERSION_BEGIN");
+        write(keys, "test=short\n", badTime);
+        for (int i = 0; i < 50; i++) reload(server);
+        write(keys, "test=short\n", FileTime.fromMillis(badTime.toMillis() + 1));
+        for (int i = 0; i < 50; i++) reload(server);
+        // A size-only change is a new version too.
+        write(keys, "test=shorter\n", FileTime.fromMillis(badTime.toMillis() + 1));
+        for (int i = 0; i < 50; i++) reload(server);
+        write(keys, "test=" + a + "\n", future);
+        reload(server);
+        System.out.println("KEYS_NEW_VERSION_END");
         System.out.println("PATHS_RECOVERY_BEGIN");
         write(paths, "test=" + (char) 92 + "uZZZZ\n", badTime);
-        for (int i = 0; i < 3; i++) eq(reload(server)[1].getProperty("test"), "/future");
+        for (int i = 0; i < 50; i++) eq(reload(server)[1].getProperty("test"), "/future");
         write(paths, "test=/future\n", future);
         for (int i = 0; i < 10; i++) eq(reload(server)[1].getProperty("test"), "/future");
         System.out.println("PATHS_RECOVERY_END");

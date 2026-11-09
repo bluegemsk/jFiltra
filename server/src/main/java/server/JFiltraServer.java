@@ -71,7 +71,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraServer {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.1.8";
+    private static final String VERSION = "1.1.9";
     
     // Logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraServer.class);
@@ -133,6 +133,8 @@ public class JFiltraServer {
     private long keysSize, pathsSize;
     private boolean keysUnsettled, pathsUnsettled;
     private boolean keysReloadFailed, pathsReloadFailed;
+    private FileTime keysFailedModified, pathsFailedModified;
+    private long keysFailedSize, pathsFailedSize;
     private Properties clientPaths;   // Maps client IDs to their storage directories
 
     /**
@@ -247,9 +249,11 @@ public class JFiltraServer {
                 continue;
             }
             boolean keys = setting.equals("client.keys.path");
+            FileTime modified = null;
+            long size = -1;
             try {
-                FileTime modified = Files.getLastModifiedTime(Paths.get(path.trim()));
-                long size = Files.size(Paths.get(path.trim()));
+                modified = Files.getLastModifiedTime(Paths.get(path.trim()));
+                size = Files.size(Paths.get(path.trim()));
                 if (modified.equals(keys ? keysModified : pathsModified)
                         && size == (keys ? keysSize : pathsSize) && !(keys ? keysUnsettled : pathsUnsettled)
                         && !(keys ? keysReloadFailed : pathsReloadFailed)) {
@@ -282,14 +286,23 @@ public class JFiltraServer {
                     logger.info(setting + " is valid again");
                 }
             } catch (IOException | IllegalArgumentException e) {
+                boolean report = !(keys ? keysReloadFailed : pathsReloadFailed)
+                        || !java.util.Objects.equals(modified, keys ? keysFailedModified : pathsFailedModified)
+                        || size != (keys ? keysFailedSize : pathsFailedSize);
                 if (keys) {
                     keysReloadFailed = true;
+                    keysFailedModified = modified;
+                    keysFailedSize = size;
                 } else {
                     pathsReloadFailed = true;
+                    pathsFailedModified = modified;
+                    pathsFailedSize = size;
                 }
                 // Our loader and key validation report the path/label, never a key value.
-                logger.error("Cannot reload " + setting + "; keeping last good configuration: "
-                        + printable(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
+                if (report) {
+                    logger.error("Cannot reload " + setting + "; keeping last good configuration: "
+                            + printable(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
+                }
             }
         }
         return new Properties[] {clientKeys, clientPaths};
@@ -823,6 +836,18 @@ public class JFiltraServer {
                 dos.writeUTF(e.reply);
             } catch (IOException ignored) {
                 // Connection already broken - nothing more to report
+            }
+        } catch (java.nio.file.FileSystemException e) {
+            logger.error("Transfer of file " + logName + " from client " + logLabel
+                    + " failed: cannot write to storage directory: " + e.getClass().getSimpleName()
+                    + " " + printable(String.valueOf(e.getFile()))
+                    + (e.getReason() == null ? "" : " (" + printable(e.getReason()) + ")"));
+            if (dos != null) {
+                try {
+                    dos.writeUTF("ERROR: Transfer failed");
+                } catch (IOException ignored) {
+                    // Connection already broken.
+                }
             }
         } catch (Exception e) {
             if (e instanceof EOFException || e instanceof SocketTimeoutException || e instanceof SocketException) {
