@@ -135,13 +135,15 @@ e.g. `password=`, `sslpassword=`, `trustStorePassword=`, `keyStorePassword=`,
 `trustCertificateKeyStorePassword=`, `keyPassword=`, `db_password=`, `PWD=`;
 also brace-quoted values such as `password={Top;Secret}` and quoted values such
 as `password="a secret"` or `password='a secret'` (a leading quote counts only
-when the value is closed and then ends or is followed by `&`, whitespace, or `)`
+when the value is closed and then ends or is followed by `&`, `;`, whitespace, or `)`
 in a `(key=…)` form; otherwise the whole unquoted text is masked, e.g.
 `password="Wq8"Er5`); an unquoted value runs up to the next `&` or whitespace,
 and also up to `)` when the key sits in parentheses, e.g.
 `(password=Ab,cd9XyZ)` in a MySQL `address=` URL, so `;` in a PostgreSQL URL
-password is masked too) and the passwords
-from `db.password`, `db.password.env` and `db.url` (4 characters or longer) are
+password is masked too). When collecting secrets from `db.url`, the client keeps spaces in an unquoted value up to `&`, or up to `)`
+only in the `(key=…)` form; e.g. `password=ab)cdef&x=1` keeps `ab)cdef` as
+one secret. The passwords from `db.password`, `db.password.env` and `db.url`
+(4 characters or longer) are
 replaced by `****` in every logged line, including database error messages. If
 masking a message ever fails, the line shows the error class with
 `(message hidden: masking failed)` instead of the text; the client goes on as

@@ -65,6 +65,7 @@ public class JFiltraClient {
     private boolean moveToSent;                 // after.send=move: move sent files to <source>/sent/
     private String fileOrder;                   // file.order: time, size or name, ! reverses
     private Comparator<Candidate> fileComparator; // Order in which files are sent
+    private boolean lastRemovalFailed;          // Stop once mode on pre-check or post-delivery cleanup failure
     private boolean lastFileSent;               // Whether the last processFile call succeeded
 
     // Files delivered whose deletion failed, with their snapshot: only the delete is retried,
@@ -284,8 +285,11 @@ public class JFiltraClient {
         
         // Properties.load removes backslashes, so reject them in the raw value first.
         for (String line : text.split("\\r\\n|\\r|\\n")) {
-            if (line.matches("\\s*filemask(?:\\s*[:=]|\\s+).*") && line.indexOf('\\') >= 0) {
-                throw new IllegalArgumentException("Setting filemask must not contain a backslash");
+            for (String setting : new String[] {"filemask", "ignore.patterns"}) {
+                if (line.matches("\\s*" + setting.replace(".", "\\.") + "(?:\\s*[:=]|\\s+).*")
+                        && line.indexOf('\\') >= 0) {
+                    throw new IllegalArgumentException("Setting " + setting + " must not contain a backslash");
+                }
             }
         }
         Properties props = new Properties();
@@ -586,8 +590,8 @@ public class JFiltraClient {
                 if (lastFileSent) {
                     return EXIT_SENT;
                 }
-                if (serverRetryAt != 0) {
-                    return EXIT_TRANSFER_FAILED; // Unreachable server: stop immediately.
+                if (lastRemovalFailed || serverRetryAt != 0) {
+                    return EXIT_TRANSFER_FAILED; // Cleanup problem or unreachable server: stop immediately.
                 }
                 // Per-file failure: try the next candidate in this same run.
             }
@@ -802,7 +806,25 @@ public class JFiltraClient {
         String fileName = filePath.getFileName().toString();
         logger.debug("Processing file: " + fileName);
         long startTime = System.currentTimeMillis();
-        
+        lastRemovalFailed = false;
+        // Do not upload a file we already know cannot be removed after delivery.
+        Path sourceDir = filePath.getParent();
+        Path removalDir = sourceDir;
+        if (moveToSent) {
+            Path sentDir = sourceDir.resolve("sent");
+            if (Files.exists(sentDir, LinkOption.NOFOLLOW_LINKS)) {
+                removalDir = sentDir;
+            }
+        }
+        if (!Files.isDirectory(removalDir) || !Files.isWritable(removalDir)) {
+            logger.error("Cannot send " + fileName + ": not a writable directory: " + removalDir);
+            lastRemovalFailed = true;
+            if (!runOnce) {
+                scheduleRetry(filePath, snapshot, fileName);
+            }
+            return;
+        }
+
         try {
             // First pass: hash the file and measure its compressed, encrypted size, which
             // the server needs before the data. Nothing is stored, so no temp files are needed.
@@ -834,6 +856,7 @@ public class JFiltraClient {
             serverRetryDelay = 0;
             
             if ("SUCCESS".equals(response)) {
+                lastRemovalFailed = true; // Cleared only when local cleanup succeeds.
                 double seconds = (System.currentTimeMillis() - startTime) / 1000.0;
                 String size = snapshot.substring(0, snapshot.indexOf(':'));
                 logger.info(String.format("File sent: %s (%s bytes, %.2f s, SHA-256 %s)", fileName, size, seconds, fileHash));
@@ -846,6 +869,7 @@ public class JFiltraClient {
                 }
                 retries.remove(filePath);
                 lastFileSent = finishDelivered(filePath, snapshot);
+                lastRemovalFailed = !lastFileSent;
             } else if (PERMANENT_REJECTIONS.contains(response)) {
                 // Don't resend a file the server will always reject; it is tried again once it changes
                 rejectedFiles.put(filePath, snapshot);
@@ -923,7 +947,8 @@ public class JFiltraClient {
             deliveredFiles.remove(filePath);
             return true;
         } catch (IOException e) {
-            logger.error("File " + fileName + " was delivered but can't be " + (moveToSent ? "moved to sent/" : "deleted") + " (it is not sent again): " + e);
+            logger.error("File " + fileName + " was delivered but can't be " + (moveToSent ? "moved to sent/" : "deleted")
+                    + (runOnce ? " (restore permissions before the next run): " : " (it is not sent again): ") + e);
             deliveredFiles.put(filePath, snapshot);
             scheduleRetry(filePath, snapshot, fileName);
             return false;
@@ -943,7 +968,8 @@ public class JFiltraClient {
         long delay = (previous == null) ? pollingIntervalSeconds * 1000L : previous.delayMillis * 2;
         delay = Math.min(delay, MAX_REJECTION_RETRY_MILLIS);
         retries.put(filePath, new Retry(snapshot, delay, System.currentTimeMillis() + delay));
-        logger.warn("Will retry " + fileName + " in " + (delay / 1000) + " s");
+        logger.warn(runOnce ? "Will retry " + fileName + " on the next run"
+                : "Will retry " + fileName + " in " + (delay / 1000) + " s");
     }
 
     /**
@@ -954,7 +980,8 @@ public class JFiltraClient {
         long delay = (serverRetryDelay == 0) ? pollingIntervalSeconds * 1000L : serverRetryDelay * 2;
         serverRetryDelay = Math.min(delay, MAX_NETWORK_RETRY_MILLIS);
         serverRetryAt = System.currentTimeMillis() + serverRetryDelay;
-        logger.warn("Will try the server again in " + (serverRetryDelay / 1000) + " s");
+        logger.warn(runOnce ? "Will try the server again on the next run"
+                : "Will try the server again in " + (serverRetryDelay / 1000) + " s");
     }
 
     /**

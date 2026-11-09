@@ -165,7 +165,9 @@ also still work.
 stored in `server/incoming/`. The storage directory is created if it doesn't exist.
 
 Client key and storage-path mappings are reloaded per connection when their file
-modification time changes. Invalid updates are logged; the last good copy stays active.
+modification time or size changes. Recently modified files are rechecked on each
+connection until unchanged for 2 seconds. Invalid updates are logged with the reason;
+the last good copy stays active.
 
 ### Client
 
@@ -189,6 +191,7 @@ modification time changes. Invalid updates are logged; the last good copy stays 
 
 `ignore.patterns` is split on every comma, including the comma in `{a,b}`;
 brace alternatives containing commas are not supported. Use separate patterns instead.
+Raw backslashes in `ignore.patterns` (as in `filemask`) are refused at startup.
 
 ### File mask
 
@@ -253,7 +256,15 @@ client/script/start-client.sh; echo "exit code $?"
   source directory and is tried again by the next run.
 - A per-file failure is skipped and the next file in order is tried in the same
   run. An unreachable server stops the run immediately. If all attempted files
-  fail, the exit code is 3.
+  fail, the exit code is 3. Retries are deferred to the next run.
+- Before each send, `after.send=delete` requires a writable source directory.
+  With `after.send=move`, an existing `sent/` must be a writable directory; if it
+  is missing, the source directory must be writable so `sent/` can be created.
+  A failed check prevents the send and immediately ends a one-time run with exit 3.
+- If deletion/moving still fails after delivery (for example permissions change
+  during transfer), once mode stops immediately with exit 3, without sending any
+  further files. Fix the permissions and remove or move the already-delivered file
+  from the outbox before running again, especially with append.
 - The value is not case-sensitive. An invalid `run.mode` or `file.order` stops
   the client with exit code 1.
 
@@ -428,6 +439,10 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
 
 ### Retries
 
+Before sending, the client checks directory writability as described under
+[One-time run](#one-time-run). An unwritable directory is logged and no upload is
+attempted. Loop mode retries the check later; once mode exits 3 immediately.
+
 The client never gives up on a file, but it waits longer between attempts when
 retrying doesn't help right away, so a large file isn't sent again in full on
 every poll:
@@ -445,7 +460,11 @@ every poll:
   file named `sent` in the way): the file is **not sent again**. Only the delete
   or move is retried, with the same growing delays,
   so the server never gets it twice (this matters for `append` and `rename`).
-  After a client restart the file is sent once more.
+  This delivered-file memory lasts only for the running loop process. Once mode
+  stops immediately with exit 3 if cleanup fails, and schedules no timed retry.
+  After a client restart (or a new one-time run) the file can be sent once more;
+  fix permissions and remove or move that already-delivered file from the outbox
+  before running again to avoid duplicates with append.
 - **Rejected for a reason a person can fix** (`File already exists`, `Decryption
   failed`, `No encryption key found`, a failed hash check): the file is retried after the polling
   interval, then after twice as long each time, up to 10 minutes. Fixing the

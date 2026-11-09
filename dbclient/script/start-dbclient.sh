@@ -29,6 +29,8 @@ fi
 JAVA_VERSION="$("$JAVA" -version 2>&1 | awk -F '"' '/version/ {print $2; exit}')"
 JAVA_MAJOR="${JAVA_VERSION%%.*}"
 [ "$JAVA_MAJOR" = "1" ] && JAVA_MAJOR="$(echo "$JAVA_VERSION" | cut -d. -f2)"
+# Early-access/build suffixes follow the leading digits.
+JAVA_MAJOR="$(printf '%s' "$JAVA_MAJOR" | sed 's/[^0-9].*$//')"
 case "$JAVA_MAJOR" in
   ''|*[!0-9]*) echo "Error: Could not read the Java version of $JAVA." >&2; exit 1 ;;
 esac

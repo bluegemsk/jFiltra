@@ -575,11 +575,11 @@ public class JFiltraDbClient {
                 }
             }
             if (end < 0) {
-                // Diagnostic text ends at whitespace; JDBC URL secrets include spaces up to & or ).
+                // Diagnostic text ends at whitespace; JDBC URL secrets include spaces; ) ends only the (key=...) form.
                 end = valueStart;
                 while (end < n) {
                     char ch = s.charAt(end);
-                    if (ch == '&' || (!jdbcUrl && isRegexSpace(ch)) || ((jdbcUrl || parenForm) && ch == ')')) {
+                    if (ch == '&' || (!jdbcUrl && isRegexSpace(ch)) || (parenForm && ch == ')')) {
                         break;
                     }
                     end++;

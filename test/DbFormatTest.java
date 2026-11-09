@@ -146,7 +146,7 @@ public class DbFormatTest {
         eq(JFiltraDbClient.urlPasswords("jdbc:mysql://address=(host=h)(user=pwt)(password=Ab,cd9XyZ)/test").toString(), "[Ab,cd9XyZ]");
         for (String pw : new String[] {"Ab,cd9", "Ab'cd9", "Ab\"cd9", "Ab;cd9XyZ", "Rt)yu1Op"}) {
             eq(JFiltraDbClient.mask("jdbc:x://h/db?user=a&password=" + pw + "&ssl=1"), "jdbc:x://h/db?user=a&password=****&ssl=1");
-            eq(JFiltraDbClient.urlPasswords("jdbc:x://h/db?password=" + pw + "&ssl=1").toString(), "[" + (pw.contains(")") ? pw.substring(0, pw.indexOf(')')) : pw) + "]");
+            eq(JFiltraDbClient.urlPasswords("jdbc:x://h/db?password=" + pw + "&ssl=1").toString(), "[" + pw + "]");
         }
         // ) ends the value only in (key=...) form; passwords with ) belong in URL parameters
         for (String pw : new String[] {"Ab,cd9", "Ab'cd9", "Ab\"cd9", "Ab;cd9"}) {
@@ -169,6 +169,10 @@ public class DbFormatTest {
                 "Driver error: password=****&x=1");
         eq(JFiltraDbClient.safe("Driver error: password=two words&x=1", java.util.Arrays.asList("two ", "two words")),
                 "Driver error: password=****&x=1");
+        eq(JFiltraDbClient.urlPasswords("jdbc:x://h?password=ab)cdef&x=1").toString(), "[ab)cdef]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:x://h?password=ab)cd ef&x=1").toString(), "[ab)cd ef]");
+        eq(JFiltraDbClient.urlPasswords("jdbc:x://(password=ab)cdef)/db").toString(), "[ab]");
+        eq(JFiltraDbClient.safe("Driver rejected ab)cdef", JFiltraDbClient.urlPasswords("jdbc:x://h?password=ab)cdef&x=1")), "Driver rejected ****");
         // Partial quote then more text: whole value masked (C1b)
         eq(JFiltraDbClient.mask("jdbc:x://h/db?password=\"Wq8\"Er5&ssl=1"), "jdbc:x://h/db?password=****&ssl=1");
         eq(JFiltraDbClient.mask("jdbc:x://h/db?password='Fg6'Hj7&ssl=1"), "jdbc:x://h/db?password=****&ssl=1");

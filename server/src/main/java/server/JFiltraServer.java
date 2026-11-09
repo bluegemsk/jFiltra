@@ -130,6 +130,8 @@ public class JFiltraServer {
     // Client-specific configuration
     private Properties clientKeys;    // Maps client IDs to their encryption keys
     private FileTime keysModified, pathsModified;
+    private long keysSize, pathsSize;
+    private boolean keysUnsettled, pathsUnsettled;
     private Properties clientPaths;   // Maps client IDs to their storage directories
 
     /**
@@ -180,11 +182,15 @@ public class JFiltraServer {
             String clientKeysPath = config.getProperty("client.keys.path");
             clientKeys = (clientKeysPath != null) ? loadProperties(clientKeysPath.trim()) : new Properties();
             keysModified = clientKeysPath == null ? null : Files.getLastModifiedTime(Paths.get(clientKeysPath.trim()));
+            keysSize = clientKeysPath == null ? 0 : Files.size(Paths.get(clientKeysPath.trim()));
+            keysUnsettled = keysModified != null && System.currentTimeMillis() - keysModified.toMillis() < 2000;
             
             // Load client storage path mappings from configuration file
             String clientPathsConfig = config.getProperty("client.paths.config");
             clientPaths = (clientPathsConfig != null) ? loadProperties(clientPathsConfig.trim()) : new Properties();
             pathsModified = clientPathsConfig == null ? null : Files.getLastModifiedTime(Paths.get(clientPathsConfig.trim()));
+            pathsSize = clientPathsConfig == null ? 0 : Files.size(Paths.get(clientPathsConfig.trim()));
+            pathsUnsettled = pathsModified != null && System.currentTimeMillis() - pathsModified.toMillis() < 2000;
             
             // Log server startup and configuration details
             logger.info("=========================================");
@@ -236,9 +242,12 @@ public class JFiltraServer {
             boolean keys = setting.equals("client.keys.path");
             try {
                 FileTime modified = Files.getLastModifiedTime(Paths.get(path.trim()));
-                if (modified.equals(keys ? keysModified : pathsModified)) {
+                long size = Files.size(Paths.get(path.trim()));
+                if (modified.equals(keys ? keysModified : pathsModified)
+                        && size == (keys ? keysSize : pathsSize) && !(keys ? keysUnsettled : pathsUnsettled)) {
                     continue;
                 }
+                boolean unsettled = System.currentTimeMillis() - modified.toMillis() < 2000;
                 Properties updated = loadProperties(path.trim());
                 if (keys) {
                     for (String label : updated.stringPropertyNames()) {
@@ -246,15 +255,19 @@ public class JFiltraServer {
                     }
                     clientKeys = updated;
                     keysModified = modified;
+                    keysSize = size;
+                    keysUnsettled = unsettled;
                 } else {
                     clientPaths = updated;
                     pathsModified = modified;
+                    pathsSize = size;
+                    pathsUnsettled = unsettled;
                 }
                 logger.info("Reloaded " + setting);
             } catch (IOException | IllegalArgumentException e) {
-                // Do not log parser details: they could contain a key from the file.
-                logger.error("Cannot reload " + setting + "; keeping last good configuration ("
-                        + e.getClass().getSimpleName() + ")");
+                // Our loader and key validation report the path/label, never a key value.
+                logger.error("Cannot reload " + setting + "; keeping last good configuration: "
+                        + printable(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
             }
         }
         return new Properties[] {clientKeys, clientPaths};

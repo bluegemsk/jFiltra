@@ -15,7 +15,7 @@ JAVA
 printf '#!/bin/bash\nexit 0\n' > "$WORK/jdk/bin/javac"
 cp "$WORK/jdk/bin/javac" "$WORK/jdk/bin/jar"
 chmod +x "$WORK/jdk/bin/"*
-for side in client server; do
+for side in client server dbclient; do
   mkdir -p "$WORK/$side/script" "$WORK/$side/lib"
   cp "$ROOT/$side/script/compile.sh" "$ROOT/$side/script/start-$side.sh" "$WORK/$side/script/"
   for script in compile "start-$side"; do
@@ -29,4 +29,4 @@ for side in client server; do
     done
   done
 done
-echo "Java version scripts: 32 cases passed"
+echo "Java version scripts: 48 cases passed"

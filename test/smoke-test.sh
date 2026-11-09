@@ -102,7 +102,7 @@ else
   check "on.name.conflict unit tests compile" false
 fi
 
-check "Java version scripts (32 normal, EA, build-suffix and invalid cases)" bash "$ROOT/test/java-version-test.sh"
+check "Java version scripts (48 normal, EA, build-suffix and invalid cases)" bash "$ROOT/test/java-version-test.sh"
 
 # Isolated server with a fault-injecting ServerSocket, no OS resource exhaustion needed.
 if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/server/lib/*" -d "$WORK/unit" "$ROOT/test/ServerConnectionTest.java" 2>/dev/null; then
@@ -114,6 +114,22 @@ if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/server/lib/*" -d "$WORK/unit"
   check "connect-and-close is not logged at info level" [ "$(count 'Client connected:' "$WORK/connection.log")" = 3 ]
 else
   check "connection regression tests compile" false
+fi
+
+if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/client/lib/*" -d "$WORK/unit" "$ROOT/test/AfterSendTest.java" 2>/dev/null; then
+  mkdir -p "$WORK/after-send-test"
+  "$JAVA" -Dlog4j2.configurationFile="$ROOT/client/config/log4j2.properties" -cp "$WORK/unit:$ROOT/client/lib/*" client.AfterSendTest "$WORK/after-send-test" > "$WORK/after-send-test.log" 2>&1
+  check "cleanup permission races: delete/move, once stops and loop retries cleanup only" [ "$?" = 0 ]
+else
+  check "cleanup permission-race tests compile" false
+fi
+if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/server/lib/*" -d "$WORK/unit" "$ROOT/test/ServerReloadTest.java" 2>/dev/null; then
+  "$JAVA" -Dlog4j2.configurationFile="$ROOT/server/config/log4j2.properties" -cp "$WORK/unit:$ROOT/server/lib/*" server.ServerReloadTest "$WORK/reload-test" > "$WORK/reload-test.log" 2>&1
+  check "reload detects size and unsettled/two-step writes" [ "$?" = 0 ]
+  check "reload error names the label and reason" grep -q 'Encryption key for test is too short' "$WORK/reload-test.log"
+  check "reload error does not expose the key value" bash -c '! grep -q SecretLeak_X "$1"' _ "$WORK/reload-test.log"
+else
+  check "reload regression tests compile" false
 fi
 
 echo "Build checks"
@@ -218,6 +234,14 @@ for mask in 'sub\*.csv' 'sub\\*.csv'; do
   check "raw backslash filemask rejected ($mask)" [ "$?" = 1 ]
   check "raw backslash error names filemask" grep -q 'Setting filemask must not contain a backslash' "$WORK/client-rawmask/console.log"
   rm -rf "$WORK/client-rawmask"
+done
+for pattern in 'foo\*.tmp' 'foo\\*.tmp'; do
+  cp -R "$WORK/client4" "$WORK/client-rawignore"
+  printf 'ignore.patterns=%s\n' "$pattern" >> "$WORK/client-rawignore/config/client.properties"
+  (cd "$WORK/client-rawignore" && "$JAVA" -cp "lib/*" client.JFiltraClient config/client.properties > console.log 2>&1)
+  check "raw ignore.patterns backslash rejected ($pattern)" [ "$?" = 1 ]
+  check "raw ignore.patterns error names setting" grep -q 'Setting ignore.patterns must not contain a backslash' "$WORK/client-rawignore/console.log"
+  rm -rf "$WORK/client-rawignore"
 done
 for pattern in '[abc' '{a,b}'; do
   cp -R "$WORK/client4" "$WORK/client-badignore"
@@ -354,6 +378,8 @@ code="$(run_once name)"
 check "once: retryable first-file rejection does not block next file" [ "$code" = 0 -a -f "$WORK/src5/a.txt" -a ! -e "$WORK/src5/b.txt" ]
 code="$(run_once name)"
 check "once: all attempted files fail: exit 3" [ "$code" = 3 ]
+check "once: retry message says next run" grep -q 'Will retry a.txt on the next run' "$C5/once.log"
+check "once: no timed retry is promised" bash -c '! grep -Eq "Will retry .* in [0-9]+ s|Will try the server again in" "$1"' _ "$C5/once.log"
 rm -rf "$WORK/received/client5/a.txt"
 cp "$WORK/src5/a.txt" "$WORK/received/client5/a.txt"
 sed -i "s|^encryption.key=.*|encryption.key=$WRONG_KEY|" "$C5/config/client.properties"
@@ -412,17 +438,17 @@ echo "other" > "$WORK/src5/other.txt"
 code="$(run_once name)"
 check "move: file named sent is not delivered" [ -f "$WORK/src5/sent" -a ! -e "$WORK/received/client5/sent" ]
 check "move: reserved sent name is logged once" grep -q 'Skipping file named "sent".*reserved for the sent/ directory' "$C5/once.log" "$C5/logs/client_jfiltra.log"
-# other.txt may be delivered but cannot be moved while sent (the file) blocks sent/
+# The pre-check prevents delivery while sent (the file) blocks the archive directory.
 check "move: other file stays while sent file blocks the archive dir" [ -f "$WORK/src5/other.txt" ]
 check "move: blocking sent file names the problem for the other file" \
-  grep -q "other.txt was delivered but can't be moved to sent/.*is not a directory" "$C5/once.log" "$C5/logs/client_jfiltra.log"
+  grep -q "Cannot send other.txt: not a writable directory: .*sent" "$C5/once.log" "$C5/logs/client_jfiltra.log"
 
-# Still: with filemask, only m2 is a candidate; sent file blocks the move
+# With filemask only m2 is a candidate; the same pre-check still prevents delivery.
 rm -rf "$WORK/src5" && mkdir -p "$WORK/src5" && echo x > "$WORK/src5/sent" && echo y > "$WORK/src5/m2.txt"
 echo "filemask=m*.txt" >> "$C5/config/client.properties"
 code="$(run_once name)"
 check "move: 'sent' file in the way keeps the file and names the problem" \
-  [ -f "$WORK/src5/m2.txt" ] && grep -q "m2.txt was delivered but can't be moved to sent/.*is not a directory" "$C5/once.log" "$C5/logs/client_jfiltra.log"
+  [ -f "$WORK/src5/m2.txt" ] && grep -q "Cannot send m2.txt: not a writable directory: .*sent" "$C5/once.log" "$C5/logs/client_jfiltra.log"
 sed -i '/^filemask=/d' "$C5/config/client.properties"
 
 # D2: sent as a symbolic link to a directory
@@ -519,12 +545,37 @@ start "$WORK/server-mode" server.JFiltraServer server.properties jfiltra-server.
 wait_for 15 grep -q "Server is running" "$MODE_LOG" 2>/dev/null
 mkdir -p "$WORK/client6" && cp -R "$ROOT/client/lib" "$ROOT/client/config" "$WORK/client6/"
 write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+# Three separate once runs must not append even once while cleanup is impossible.
+for action in delete move; do
+  rm -rf "$WORK/src6" && mkdir -p "$WORK/src6"
+  echo "$action content" > "$WORK/src6/$action.txt"
+  echo "must not send next" > "$WORK/src6/z-$action.txt"
+  if [ "$action" = move ]; then mkdir "$WORK/src6/sent"; locked="$WORK/src6/sent"; else locked="$WORK/src6"; fi
+  chmod 555 "$locked"
+  write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+  printf 'run.mode=once\nafter.send=%s\nfile.order=name\n' "$action" >> "$WORK/client6/config/client.properties"
+  for attempt in 1 2 3; do
+    (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile="$WORK/client6/config/log4j2.properties" -cp 'lib/*' client.JFiltraClient config/client.properties > "once-$action-$attempt.log" 2>&1)
+    check "$action: once run $attempt exits 3 without upload" [ "$?" = 3 -a ! -e "$WORK/received/parallel/$action.txt" -a ! -e "$WORK/received/parallel/z-$action.txt" ]
+    check "$action: once run $attempt names blocked directory in one ERROR" [ "$(count "ERROR.*Cannot send .*not a writable directory: $locked" "$WORK/client6/once-$action-$attempt.log")" = 1 ]
+  done
+  chmod 755 "$locked"
+  (cd "$WORK/client6" && "$JAVA" -cp 'lib/*' client.JFiltraClient config/client.properties > "restored-$action.log" 2>&1)
+  check "$action: once succeeds after permissions restored" [ "$?" = 0 ]
+  check "$action: appended exactly once across four runs" cmp -s "$WORK/received/parallel/$action.txt" <(echo "$action content")
+done
+# Missing sent/: the source must allow its creation.
+rm -rf "$WORK/src6" && mkdir "$WORK/src6"; echo missing > "$WORK/src6/missing.txt"; chmod 555 "$WORK/src6"
+(cd "$WORK/client6" && "$JAVA" -cp 'lib/*' client.JFiltraClient config/client.properties > missing-sent.log 2>&1)
+check "move: missing sent and read-only source exits 3 without upload" [ "$?" = 3 -a ! -e "$WORK/received/parallel/missing.txt" ]
+chmod 755 "$WORK/src6"; rm "$WORK/src6/missing.txt"
+write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
 echo "line" > "$WORK/src6/log.txt" && chmod 555 "$WORK/src6"
 start "$WORK/client6" client.JFiltraClient client.properties jfiltra-client.jar
-wait_for 15 [ -f "$WORK/received/parallel/log.txt" ]
+wait_for 15 grep -q "Cannot send log.txt: not a writable directory:" "$WORK/client6/logs/client_jfiltra.log"
 sleep 8
-check "undeletable file appended only once" cmp -s "$WORK/received/parallel/log.txt" <(echo "line")
-check "undeletable file reported as not sent again" grep -q "can't be deleted (it is not sent again)" "$WORK/client6/logs/client_jfiltra.log"
+check "unwritable source is not uploaded" [ ! -e "$WORK/received/parallel/log.txt" ]
+check "unwritable source reported before sending" grep -q "Cannot send log.txt: not a writable directory:" "$WORK/client6/logs/client_jfiltra.log"
 chmod 755 "$WORK/src6"
 check "file deleted once the directory is writable" wait_for 20 [ ! -e "$WORK/src6/log.txt" ]
 check "still appended only once" cmp -s "$WORK/received/parallel/log.txt" <(echo "line")
