@@ -71,7 +71,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraServer {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.1.9";
+    private static final String VERSION = "1.1.10";
     
     // Logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraServer.class);
@@ -636,6 +636,7 @@ public class JFiltraServer {
     private void handleClient(Socket clientSocket) {
         // Temporary file for this transfer; deleted in the finally block unless published
         Path partFile = null;
+        Set<File> unreadableComparisons = new LinkedHashSet<>();
         DataOutputStream dos = null;
         ScheduledFuture<?> deadline = null;
         
@@ -762,7 +763,7 @@ public class JFiltraServer {
             // Name already taken: with the same content (e.g. the client missed the earlier
             // reply), or with reject, answer without storing the upload. Append always appends.
             if (!onNameConflict.equals("append") && destinationFile.exists()) {
-                boolean identical = existingFileMatches(destinationFile, fileHash);
+                boolean identical = existingFileMatches(destinationFile, fileHash, unreadableComparisons);
                 if (identical || onNameConflict.equals("reject")) {
                     String receivedHash = receiveFile(dis, fileSize, encryptionKey, null);
                     if (!hashesMatch(receivedHash, fileHash)) {
@@ -800,7 +801,7 @@ public class JFiltraServer {
                 }
             } else if (!publishFile(partFile, destinationFile.toPath())) {
                 // Name taken (also by a transfer that finished meanwhile)
-                boolean identical = existingFileMatches(destinationFile, fileHash);
+                boolean identical = existingFileMatches(destinationFile, fileHash, unreadableComparisons);
                 if (identical || onNameConflict.equals("reject")) {
                     respondToNameConflict(dos, identical, destinationFile, clientLabel);
                     return;
@@ -917,7 +918,7 @@ public class JFiltraServer {
                      target == null ? new OutputStream() {
                          @Override public void write(int b) { }
                          @Override public void write(byte[] b, int off, int len) { }
-                     } : new BufferedOutputStream(Files.newOutputStream(target, StandardOpenOption.CREATE_NEW)), digest)) {
+                     } : storageOutput(target), digest)) {
 
             // Decompress data in chunks, stopping if the output exceeds the size limit
             byte[] buffer = new byte[8192];
@@ -940,6 +941,11 @@ public class JFiltraServer {
                 // Connection broken or timed out - the client can't be answered anyway
             }
             
+            // A known storage failure stays a storage failure even if draining the client failed.
+            if (e instanceof java.nio.file.FileSystemException) {
+                throw e;
+            }
+
             // Missing bytes mean the connection was lost, whatever error the incomplete data caused
             if (body.remaining() > 0) {
                 throw connectionLost(body.remaining(), byteCount);
@@ -963,6 +969,29 @@ public class JFiltraServer {
         return toHex(digest.digest());
     }
 
+    /** Wraps only storage output failures, including the final buffered flush/close. */
+    private OutputStream storageOutput(final Path target) throws IOException {
+        final OutputStream out = new BufferedOutputStream(
+                Files.newOutputStream(target, StandardOpenOption.CREATE_NEW));
+        return new OutputStream() {
+            @Override public void write(int b) throws IOException {
+                try { out.write(b); } catch (IOException e) { throw storageError(e); }
+            }
+            @Override public void write(byte[] b, int off, int len) throws IOException {
+                try { out.write(b, off, len); } catch (IOException e) { throw storageError(e); }
+            }
+            @Override public void flush() throws IOException {
+                try { out.flush(); } catch (IOException e) { throw storageError(e); }
+            }
+            @Override public void close() throws IOException {
+                try { out.close(); } catch (IOException e) { throw storageError(e); }
+            }
+            private IOException storageError(IOException e) {
+                return new java.nio.file.FileSystemException(target.toString(), null, e.getMessage());
+            }
+        };
+    }
+
     /**
      * Creates the error for an upload that ended before all announced bytes arrived.
      * 
@@ -980,11 +1009,24 @@ public class JFiltraServer {
      * 
      * @param existingFile The stored file
      * @param fileHash The SHA-256 hash to compare with
+     * @param unreadableComparisons Files already warned about during this transfer
      * @return true if the file exists and has the same content
-     * @throws Exception If the existing file cannot be read
      */
-    private boolean existingFileMatches(File existingFile, String fileHash) throws Exception {
-        return existingFile.isFile() && hashesMatch(calculateFileHash(existingFile.toPath()), fileHash);
+    private boolean existingFileMatches(File existingFile, String fileHash, Set<File> unreadableComparisons)
+            throws GeneralSecurityException {
+        if (!existingFile.isFile()) {
+            return false;
+        }
+        try {
+            return hashesMatch(calculateFileHash(existingFile.toPath()), fileHash);
+        } catch (IOException e) {
+            if (unreadableComparisons.add(existingFile)) {
+                logger.warn("Cannot read stored file " + printable(existingFile.getName())
+                        + " to compare content (" + printable(String.valueOf(e.getMessage()))
+                        + "); treating it as different");
+            }
+            return false;
+        }
     }
 
     /**
@@ -1155,8 +1197,12 @@ public class JFiltraServer {
                     out.force(true);
                 } catch (IOException e) {
                     // E.g. disk full: remove the partly appended data, keep the file as it was
-                    out.truncate(originalSize);
-                    throw e;
+                    try {
+                        out.truncate(originalSize);
+                    } catch (IOException rollbackError) {
+                        e.addSuppressed(rollbackError);
+                    }
+                    throw new java.nio.file.FileSystemException(target.toString(), null, e.getMessage());
                 }
             }
             return true;
@@ -1286,7 +1332,7 @@ public class JFiltraServer {
      * @return Hex string representation of the SHA-256 hash
      * @throws Exception If hash calculation fails
      */
-    private String calculateFileHash(Path filePath) throws Exception {
+    private String calculateFileHash(Path filePath) throws IOException, GeneralSecurityException {
         // Create SHA-256 digest for hash calculation
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         

@@ -2,21 +2,33 @@
 
 jFiltra is a lightweight Java client/server tool for moving files from watched
 directories to a central server, reliably and with as little setup as possible.
-Current version: **1.1.9** (server, client and DB client share the version).
+Current version: **1.1.10** (server, client and DB client share the version).
 
 ## Status
 
-1.1.9 (November 2026) addresses the findings from the 1.1.8 product test.
+1.1.10 (November 2026) addresses P1–P3 from the 1.1.9 product test and isolates archive-target failures per file.
 No known open bugs remain in the tested scenarios:
 
 - Bundled suites pass on Temurin 21.0.12.1 and Temurin 1.8.0_504: the file client and server smoke test
-  (207 checks; run twice on Java 8), the DB client smoke test against PostgreSQL
+  (253 checks), the DB client smoke test against PostgreSQL
   (131 checks) and MariaDB (122 with the MariaDB driver, 125 with MySQL Connector/J,
   and 122 with Connector/J cursor fetching), and the Java version script test
-  (48 cases, included in each file smoke run).
+  (48 cases, included in each file smoke run). Permission-based checks run as a
+  non-root user; Linux write failures are exercised with `ulimit -f`, including
+  new-file cleanup, buffered close failures and append rollback.
 - Earlier product test on Java 8: 300 files from two source directories with `after.send=move`,
   port probes and a key file change during the run. All files arrived intact, with
   no warnings or errors.
+- Changes in 1.1.10:
+  - Unreadable stored files are treated as different content: rename, overwrite and
+    reject still work, with one warning and no stack trace; append fails cleanly.
+  - Source directories need read and execute/search permission. Unavailable folders
+    are logged once in loop mode, with recovery logged when accessible again;
+    once mode exits 3 if no source directory is accessible.
+  - Storage write failures (including disk full, quota and OS file-size limits) are
+    logged on one contextual line, including buffered flush/close failures.
+    Failed uploads are cleaned up and failed appends are rolled back.
+  - A directory at `sent/<fileName>` blocks only that file, not its neighbours.
 - Changes in 1.1.9:
   - A file that grows during hashing is removed or archived after successful delivery
     if unchanged since the hash pass, avoiding duplicate append deliveries.
@@ -296,10 +308,13 @@ client/script/start-client.sh; echo "exit code $?"
   fail, the exit code is 3. Retries are deferred to the next run.
 - Before each send, the source directory must be writable for both `delete` and
   `move`. With `after.send=move`, an existing `sent/` must additionally be a writable
-  directory, and `sent/<fileName>` must not itself be a directory. A failed
-  pre-check prevents the send and blocks only that source
-  directory for the rest of this run; candidates in other directories are still
-  tried. Exit 0 if a file succeeds, or 3 if none succeeds and a check/transfer fails.
+  directory. A failed writability pre-check prevents the send and blocks only that
+  source directory for the rest of this run; candidates in other directories are
+  still tried. A directory at `sent/<fileName>` is instead a per-file failure:
+  that file is skipped and the next file in the same source directory is tried.
+  Exit 0 if any file succeeds, or 3 if none succeeds and a check/transfer fails.
+- Source directories require both read and execute/search permission. A directory
+  without either is logged and skipped; if none is accessible, the exit code is 3.
 - If deletion/moving still fails after delivery (for example permissions change
   during transfer), once mode stops immediately with exit 3, without sending any
   further files. Fix the permissions and remove or move the already-delivered file
@@ -313,8 +328,8 @@ Exit codes (in both modes, 1 also means a configuration error at startup):
 |------|---------|
 | `0`  | The file was sent and removed from the source directory (deleted, or moved to `sent/`) |
 | `1`  | Configuration error (missing or invalid setting, missing config file) |
-| `2`  | At least one source directory is readable, but there is no matching file or every file is still being written |
-| `3`  | No readable source directory, a failed pre-check, server not reachable, file rejected or unreadable, or sent but not deletable or movable |
+| `2`  | At least one source directory has read and execute/search permission, but there is no matching file or every file is still being written |
+| `3`  | No accessible source directory, no successful file after a pre-check/transfer failure (including an archive-target directory), server not reachable, or sent but not deletable or movable |
 
 ### Keys
 
@@ -449,8 +464,10 @@ On Windows, a service wrapper such as [NSSM](https://nssm.cc/) can run
   link to one), no file of that source directory is sent. The client logs
   `Cannot send …: not a writable directory`. Once mode skips the directory and
   exits 3 if no file from another directory succeeds; loop mode retries the check
-  with growing delays. A directory occupying `sent/<fileName>` also prevents the
-  upload, with an `archive target is a directory` error and the same retry rules.
+  with growing delays. A directory occupying `sent/<fileName>` prevents only that
+  file's upload, with an `archive target is a directory` error. Other files in the
+  same source directory can still be sent. Loop mode retries that file with growing
+  delays; once mode tries the next file (exit 0 if one succeeds, otherwise 3).
 - When the server rejects a file, the client logs the reason, for example
   `Server rejected file report.pdf: ERROR: File already exists`. The server log
   has the details. A wrong key is reported as `ERROR: Decryption failed`.

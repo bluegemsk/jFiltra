@@ -4,7 +4,7 @@
  * This project is licensed under the PolyForm Noncommercial License 1.0.0.
  *
  * Usage: ParallelSendTest <port> <label> <key> <storageDir> <mode> <count>
- *        ParallelSendTest <port> <label> <key> <storageDir> expect <announcedSize|0> <reply>
+ *        ParallelSendTest <port> <label> <key> <storageDir> expect <announcedSize|0> <reply> [dataSize]
  * Prints one line and exits with 0 if the stored result is correct for the mode.
  */
 import java.io.*;
@@ -70,7 +70,7 @@ public class ParallelSendTest {
         // Single uploads that must get a given reply: <mode> is "expect", args[6] the reply,
         // count the announced size (0 = real size)
         if (mode.equals("expect")) {
-            String reply = send(port, label, key, content(0), count == 0 ? null : (long) count);
+            String reply = send(port, label, key, args.length > 7 ? new byte[Integer.parseInt(args[7])] : content(0), count == 0 ? null : (long) count);
             if (!reply.equals(args[6])) fail("server replied " + reply + ", expected " + args[6]);
             System.out.println("ParallelSendTest: got " + reply);
             return;

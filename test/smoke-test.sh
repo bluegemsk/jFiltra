@@ -580,6 +580,74 @@ check "read-only storage has one contextual error line" [ "$(count 'Transfer of 
 check "read-only storage has no stack trace" bash -c '! grep -Eq "Error handling client|^[[:space:]]+at " "$1"' _ "$MODE_LOG"
 check "read-only storage leaves no part files" bash -c '! compgen -G "$1/.jfiltra-*.part" >/dev/null' _ "$WORK/received/parallel"
 
+# P1: unreadable stored content must not prevent the configured conflict action.
+stop_mode_server() {
+  local last=$((${#PIDS[@]} - 1))
+  kill "${PIDS[$last]}" 2>/dev/null
+  wait "${PIDS[$last]}" 2>/dev/null
+  PIDS[$last]=""
+}
+if [ "$(id -u)" != 0 ]; then
+  for mode in rename overwrite reject append; do
+    stop_mode_server
+    rm -rf "$WORK/received/parallel" "$WORK/server-mode/logs"
+    mkdir -p "$WORK/received/parallel"
+    echo old > "$WORK/received/parallel/parallel.csv"
+    chmod 000 "$WORK/received/parallel/parallel.csv"
+    write_server_config "$WORK/server-mode" "$MODE_PORT" "$mode"
+    start "$WORK/server-mode" server.JFiltraServer server.properties jfiltra-server.jar
+    wait_for 15 grep -q "Server is running" "$MODE_LOG" 2>/dev/null
+    reply=SUCCESS
+    [ "$mode" = reject ] && reply="ERROR: File already exists"
+    [ "$mode" = append ] && reply="ERROR: Transfer failed"
+    check "$mode: unreadable stored file gets configured reply" "$JAVA" -cp "$WORK/unit" ParallelSendTest "$MODE_PORT" parallel "$KEYP" x expect 0 "$reply"
+    chmod 600 "$WORK/received/parallel/parallel.csv"
+    case "$mode" in
+      rename) check "rename: unreadable original preserved, numbered file stored" bash -c 'test "$(cat "$1/parallel.csv")" = old && test "$(wc -c < "$1/parallel_1.csv")" = 100000' _ "$WORK/received/parallel" ;;
+      overwrite) check "overwrite: unreadable original replaced" [ "$(wc -c < "$WORK/received/parallel/parallel.csv")" = 100000 ] ;;
+      *) check "$mode: original preserved" cmp -s "$WORK/received/parallel/parallel.csv" <(echo old) ;;
+    esac
+    if [ "$mode" != append ]; then
+      check "$mode: one comparison warning" [ "$(count 'WARN.*Cannot read stored file parallel.csv.*treating it as different' "$MODE_LOG")" = 1 ]
+    fi
+    check "$mode: unreadable stored file has no stack trace" bash -c '! grep -Eq "Error handling client|^[[:space:]]+at " "$1"' _ "$MODE_LOG"
+    check "$mode: unreadable stored file leaves no part file" bash -c '! compgen -G "$1/.jfiltra-*.part" >/dev/null' _ "$WORK/received/parallel"
+  done
+else
+  echo "  SKIP  P1 chmod tests (root bypasses permissions)"
+fi
+
+# P3: Linux EFBIG exercises write failures (not just open/create failures).
+# Ignore SIGXFSZ so write returns IOException instead of killing the JVM.
+if [ "$(uname -s)" = Linux ]; then
+  stop_mode_server
+  rm -rf "$WORK/received/parallel" "$WORK/server-mode/logs"
+  mkdir -p "$WORK/received/parallel"
+  write_server_config "$WORK/server-mode" "$MODE_PORT" append
+  (cd "$WORK/server-mode" && trap '' XFSZ && ulimit -f 200 && exec "$JAVA" -Dlog4j2.configurationFile=config/log4j2.properties -cp 'lib/*' server.JFiltraServer config/server.properties > limit.log 2>&1) &
+  PIDS+=("$!")
+  check "file size limit server starts" wait_for 15 grep -q 'Server is running' "$MODE_LOG" 2>/dev/null
+  for size in 400000 204801; do
+    check "storage write failure ($size bytes) returns Transfer failed" "$JAVA" -cp "$WORK/unit" ParallelSendTest "$MODE_PORT" parallel "$KEYP" x expect 0 'ERROR: Transfer failed' "$size"
+    check "storage write failure ($size bytes) publishes no file" [ ! -e "$WORK/received/parallel/parallel.csv" ]
+    check "storage write failure ($size bytes) removes part" bash -c '! compgen -G "$1/.jfiltra-*.part" >/dev/null' _ "$WORK/received/parallel"
+  done
+  head -c 150000 /dev/zero > "$WORK/received/parallel/parallel.csv"
+  cp "$WORK/received/parallel/parallel.csv" "$WORK/before-append"
+  check "append write failure returns Transfer failed" "$JAVA" -cp "$WORK/unit" ParallelSendTest "$MODE_PORT" parallel "$KEYP" x expect 0 'ERROR: Transfer failed'
+  check "append write failure rolls back exact content" cmp -s "$WORK/received/parallel/parallel.csv" "$WORK/before-append"
+  check "append write failure removes part" bash -c '! compgen -G "$1/.jfiltra-*.part" >/dev/null' _ "$WORK/received/parallel"
+  check "three write failures have one contextual storage error each" [ "$(count 'Transfer of file parallel.csv from client parallel failed: cannot write to storage directory:.*File too large' "$MODE_LOG")" = 3 ]
+  check "write failures have no stack trace or connection-lost misclassification" bash -c '! grep -Eq "Error handling client|connection lost|^[[:space:]]+at " "$1"' _ "$MODE_LOG"
+  stop_mode_server
+  # Leave a normal server running for the existing restart below.
+  rm -rf "$WORK/server-mode/logs"
+  start "$WORK/server-mode" server.JFiltraServer server.properties jfiltra-server.jar
+  wait_for 15 grep -q "Server is running" "$MODE_LOG" 2>/dev/null
+else
+  echo "  SKIP  P3 ulimit tests (Linux only)"
+fi
+
 echo "Append with a source file that can't be deleted"
 rm -rf "$WORK/received/parallel" && mkdir -p "$WORK/received/parallel" "$WORK/src6"
 printf 'parallel=%s\n' "$WORK/received/parallel" > "$WORK/server-mode/config/client_paths.properties"
@@ -619,6 +687,53 @@ for attempt in 1 2 3; do
   check "move/archive target directory: run $attempt exits 3 without append" [ "$?" = 3 -a ! -e "$WORK/received/parallel/archive-dir.txt" -a -f "$WORK/src6/archive-dir.txt" ]
   check "move/archive target directory: run $attempt logs pre-check error" [ "$(count 'ERROR.*Cannot send archive-dir.txt: archive target is a directory:' "$WORK/client6/archive-dir-$attempt.log")" = 1 ]
 done
+# Archive-target conflict is per file, not per source directory.
+echo next > "$WORK/src6/b.txt"
+(cd "$WORK/client6" && "$JAVA" -cp 'lib/*' client.JFiltraClient config/client.properties > per-file-once.log 2>&1)
+check "archive target: once skips blocked file and sends b.txt (exit 0)" [ "$?" = 0 -a -f "$WORK/src6/archive-dir.txt" -a ! -e "$WORK/src6/b.txt" ]
+check "archive target: b.txt archived and stored once" cmp -s "$WORK/received/parallel/b.txt" "$WORK/src6/sent/b.txt"
+# Loop retries only the blocked file with backoff while sending its neighbour.
+echo loop-next > "$WORK/src6/c.txt"
+write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+printf 'after.send=move\nfile.order=name\n' >> "$WORK/client6/config/client.properties"
+rm -rf "$WORK/client6/logs"
+start "$WORK/client6" client.JFiltraClient client.properties jfiltra-client.jar
+check "archive target: loop still sends c.txt" wait_for 15 [ -f "$WORK/src6/sent/c.txt" ]
+check "archive target: loop schedules per-file retry" wait_for 5 grep -q 'Will retry archive-dir.txt in' "$WORK/client6/logs/client_jfiltra.log"
+sleep 6
+check "archive target: loop uses backoff, not every poll" [ "$(count 'Cannot send archive-dir.txt: archive target' "$WORK/client6/logs/client_jfiltra.log")" -le 4 ]
+rmdir "$WORK/src6/sent/archive-dir.txt"
+check "archive target: loop recovers when target directory removed" wait_for 20 [ -f "$WORK/src6/sent/archive-dir.txt" ]
+check "archive target: recovered upload appended only once" cmp -s "$WORK/received/parallel/archive-dir.txt" <(echo payload)
+last=$((${#PIDS[@]} - 1)); kill "${PIDS[$last]}"; wait "${PIDS[$last]}" 2>/dev/null; PIDS[$last]=""
+
+# P2: read without search permission is unavailable, once and loop.
+if [ "$(id -u)" != 0 ]; then
+  rm -rf "$WORK/src6" "$WORK/client6/logs"; mkdir "$WORK/src6"
+  echo search > "$WORK/src6/search.txt"
+  write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+  printf 'run.mode=once\n' >> "$WORK/client6/config/client.properties"
+  chmod 644 "$WORK/src6"
+  (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile=config/log4j2.properties -cp 'lib/*' client.JFiltraClient config/client.properties > search-once.log 2>&1)
+  check "read/no-execute source: once exits 3" [ "$?" = 3 ]
+  check "read/no-execute source: once explains permissions" grep -q 'Cannot read directory: .* (needs read and execute permission)' "$WORK/client6/search-once.log"
+  write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+  rm -rf "$WORK/client6/logs" # Do not count the preceding once-mode warning.
+  start "$WORK/client6" client.JFiltraClient client.properties jfiltra-client.jar
+  check "read/no-execute source: loop logs inaccessible folder" wait_for 10 grep -q 'Cannot read directory: .* (needs read and execute permission)' "$WORK/client6/logs/client_jfiltra.log"
+  sleep 4
+  check "read/no-execute source: loop logs once while inaccessible" [ "$(count 'Cannot read directory:' "$WORK/client6/logs/client_jfiltra.log")" = 1 ]
+  check "read/no-execute source: no upload" [ ! -e "$WORK/received/parallel/search.txt" ]
+  chmod 755 "$WORK/src6"
+  check "read/no-execute source: recovery logged" wait_for 10 grep -q 'Directory is available again:' "$WORK/client6/logs/client_jfiltra.log"
+  check "read/no-execute source: recovery delivers file" wait_for 15 [ ! -e "$WORK/src6/search.txt" ]
+  chmod 644 "$WORK/src6"
+  check "read/no-execute source: warns again after another permission loss" wait_for 10 bash -c 'test "$(grep -c "Cannot read directory:" "$1")" = 2' _ "$WORK/client6/logs/client_jfiltra.log"
+  chmod 755 "$WORK/src6"
+  last=$((${#PIDS[@]} - 1)); kill "${PIDS[$last]}"; wait "${PIDS[$last]}" 2>/dev/null; PIDS[$last]=""
+else
+  echo "  SKIP  P2 chmod tests (root bypasses permissions)"
+fi
 # G1: a writable sent/ does not compensate for a read-only source directory.
 rm -rf "$WORK/src6" && mkdir -p "$WORK/src6/sent"
 echo source-read-only > "$WORK/src6/a-source-ro.txt"; echo next > "$WORK/src6/b-source-ro.txt"

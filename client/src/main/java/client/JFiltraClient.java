@@ -41,7 +41,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraClient {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.1.9";
+    private static final String VERSION = "1.1.10";
     
     // Initialize logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraClient.class);
@@ -402,6 +402,12 @@ public class JFiltraClient {
                         }
                         continue;
                     }
+                    if (!Files.isReadable(dir) || !Files.isExecutable(dir)) {
+                        if (missingDirs.add(dirPath)) {
+                            logger.warn("Cannot read directory: " + dirPath + " (needs read and execute permission)");
+                        }
+                        continue;
+                    }
                     if (missingDirs.remove(dirPath)) {
                         logger.info("Directory is available again: " + dirPath);
                     }
@@ -561,8 +567,8 @@ public class JFiltraClient {
                             : "Directory does not exist: " + dirPath);
                     continue;
                 }
-                if (!Files.isReadable(dir)) {
-                    logger.warn("Cannot read directory: " + dirPath);
+                if (!Files.isReadable(dir) || !Files.isExecutable(dir)) {
+                    logger.warn("Cannot read directory: " + dirPath + " (needs read and execute permission)");
                     continue;
                 }
                 readableSource = true;
@@ -840,7 +846,6 @@ public class JFiltraClient {
             Path target = sentDir.resolve(fileName);
             if (Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
                 logger.error("Cannot send " + fileName + ": archive target is a directory: " + target);
-                lastPreCheckFailed = true;
                 if (!runOnce) {
                     scheduleRetry(filePath, snapshot, fileName);
                 }
