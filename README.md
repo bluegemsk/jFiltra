@@ -14,7 +14,7 @@ Test status and change history: [STATUS.md](STATUS.md).
   client's key, decrypts and decompresses the file, checks the SHA-256 hash, and
   stores the file in that client's configured storage directory.
 - The **DB client** (since 1.1.0) sends the result of an SQL query instead of
-  files: it writes the rows to a CSV, TSV or JSON Lines file, sends it like file
+  files: it writes the rows to a CSV, TSV or JSON Lines file, sends it like the file
   client, and then runs your post-transfer SQL. See [DB client](#db-client).
 
 jFiltra does not encrypt the connection. Use it on a trusted network, or through
