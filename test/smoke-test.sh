@@ -120,6 +120,9 @@ if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/client/lib/*" -d "$WORK/unit"
   mkdir -p "$WORK/after-send-test"
   "$JAVA" -Dlog4j2.configurationFile="$ROOT/client/config/log4j2.properties" -cp "$WORK/unit:$ROOT/client/lib/*" client.AfterSendTest "$WORK/after-send-test" > "$WORK/after-send-test.log" 2>&1
   check "cleanup permission races: delete/move, once stops and loop retries cleanup only" [ "$?" = 0 ]
+  check "once cleanup failure: delete/move both explain manual cleanup and conditional append risk" [ "$(count 'a.txt was delivered but could not be .*fix permissions and remove or move it before running again (if the server uses append, running again would store it twice; see README)' "$WORK/after-send-test.log")" = 2 ]
+  check "once cleanup failure: no invitation to resend on the next run" bash -c '! grep -q "Will retry a.txt on the next run" "$1"' _ "$WORK/after-send-test.log"
+  check "loop cleanup failure: existing timed retry wording retained" [ "$(count 'Will retry a.txt in' "$WORK/after-send-test.log")" = 2 ]
 else
   check "cleanup permission-race tests compile" false
 fi
@@ -477,14 +480,14 @@ check "move: reserved sent name is logged once" grep -q 'Skipping file named "se
 # The pre-check prevents delivery while sent (the file) blocks the archive directory.
 check "move: other file stays while sent file blocks the archive dir" [ -f "$WORK/src5/other.txt" ]
 check "move: blocking sent file names the problem for the other file" \
-  grep -q "Cannot send other.txt: not a writable directory: .*sent" "$C5/once.log" "$C5/logs/client_jfiltra.log"
+  grep -q "Cannot send other.txt: not a writable directory (needs write and execute permission): .*sent" "$C5/once.log" "$C5/logs/client_jfiltra.log"
 
 # With filemask only m2 is a candidate; the same pre-check still prevents delivery.
 rm -rf "$WORK/src5" && mkdir -p "$WORK/src5" && echo x > "$WORK/src5/sent" && echo y > "$WORK/src5/m2.txt"
 echo "filemask=m*.txt" >> "$C5/config/client.properties"
 code="$(run_once name)"
 check "move: 'sent' file in the way keeps the file and names the problem" \
-  [ -f "$WORK/src5/m2.txt" ] && grep -q "Cannot send m2.txt: not a writable directory: .*sent" "$C5/once.log" "$C5/logs/client_jfiltra.log"
+  [ -f "$WORK/src5/m2.txt" ] && grep -q "Cannot send m2.txt: not a writable directory (needs write and execute permission): .*sent" "$C5/once.log" "$C5/logs/client_jfiltra.log"
 sed -i '/^filemask=/d' "$C5/config/client.properties"
 
 # D2: sent as a symbolic link to a directory
@@ -670,13 +673,44 @@ for action in delete move; do
   for attempt in 1 2 3; do
     (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile="$WORK/client6/config/log4j2.properties" -cp 'lib/*' client.JFiltraClient config/client.properties > "once-$action-$attempt.log" 2>&1)
     check "$action: once run $attempt exits 3 without upload" [ "$?" = 3 -a ! -e "$WORK/received/parallel/$action.txt" -a ! -e "$WORK/received/parallel/z-$action.txt" ]
-    check "$action: once run $attempt names blocked directory in one ERROR" [ "$(count "ERROR.*Cannot send .*not a writable directory: $locked" "$WORK/client6/once-$action-$attempt.log")" = 1 ]
+    check "$action: once run $attempt names blocked directory in one ERROR" [ "$(count "ERROR.*Cannot send .*not a writable directory (needs write and execute permission): $locked" "$WORK/client6/once-$action-$attempt.log")" = 1 ]
   done
   chmod 755 "$locked"
   (cd "$WORK/client6" && "$JAVA" -cp 'lib/*' client.JFiltraClient config/client.properties > "restored-$action.log" 2>&1)
   check "$action: once succeeds after permissions restored" [ "$?" = 0 ]
   check "$action: appended exactly once across four runs" cmp -s "$WORK/received/parallel/$action.txt" <(echo "$action content")
 done
+# Q1: sent/ needs search permission as well as write permission (append must not duplicate).
+if [ "$(id -u)" != 0 ]; then
+  rm -rf "$WORK/src6" "$WORK/client6/logs"; mkdir -p "$WORK/src6/sent"
+  echo q1-content > "$WORK/src6/q1.txt"
+  echo q1-neighbour > "$WORK/src6/z-q1.txt"
+  chmod 666 "$WORK/src6/sent"
+  write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+  printf 'run.mode=once\nafter.send=move\nfile.order=name\n' >> "$WORK/client6/config/client.properties"
+  for attempt in 1 2 3; do
+    (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile=config/log4j2.properties -cp 'lib/*' client.JFiltraClient config/client.properties > "sent-no-search-$attempt.log" 2>&1)
+    check "sent/ mode 666: once run $attempt exits 3 without uploading either file" [ "$?" = 3 -a ! -e "$WORK/received/parallel/q1.txt" -a ! -e "$WORK/received/parallel/z-q1.txt" -a -f "$WORK/src6/q1.txt" -a -f "$WORK/src6/z-q1.txt" ]
+    check "sent/ mode 666: once run $attempt logs one folder-wide permission error" [ "$(count "ERROR.*Cannot send q1.txt: not a writable directory (needs write and execute permission): $WORK/src6/sent" "$WORK/client6/sent-no-search-$attempt.log")" = 1 ]
+  done
+  write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
+  printf 'after.send=move\nfile.order=name\n' >> "$WORK/client6/config/client.properties"
+  rm -rf "$WORK/client6/logs"
+  start "$WORK/client6" client.JFiltraClient client.properties jfiltra-client.jar
+  check "sent/ mode 666: loop reports missing execute permission" wait_for 10 grep -q 'not a writable directory (needs write and execute permission): .*sent' "$WORK/client6/logs/client_jfiltra.log"
+  sleep 4
+  check "sent/ mode 666: loop uploads neither file before repair" [ ! -e "$WORK/received/parallel/q1.txt" -a ! -e "$WORK/received/parallel/z-q1.txt" ]
+  check "sent/ mode 666: loop retains both source files" [ -f "$WORK/src6/q1.txt" -a -f "$WORK/src6/z-q1.txt" ]
+  chmod 755 "$WORK/src6/sent"
+  check "sent/ restored: loop archives q1.txt" wait_for 20 [ -f "$WORK/src6/sent/q1.txt" ]
+  check "sent/ restored: loop archives its neighbour" wait_for 10 [ -f "$WORK/src6/sent/z-q1.txt" ]
+  check "sent/ restored: q1.txt appended exactly once" cmp -s "$WORK/received/parallel/q1.txt" <(echo q1-content)
+  check "sent/ restored: neighbour appended exactly once" cmp -s "$WORK/received/parallel/z-q1.txt" <(echo q1-neighbour)
+  last=$((${#PIDS[@]} - 1)); kill "${PIDS[$last]}"; wait "${PIDS[$last]}" 2>/dev/null; PIDS[$last]=""
+else
+  echo "  SKIP  Q1 chmod tests (root bypasses permissions)"
+fi
+
 # O1: an archive target that is a directory must be detected before append delivery.
 rm -rf "$WORK/src6" && mkdir -p "$WORK/src6/sent/archive-dir.txt"
 echo payload > "$WORK/src6/archive-dir.txt"
@@ -743,7 +777,7 @@ chmod 555 "$WORK/src6"
 for attempt in 1 2 3; do
   (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile="$WORK/client6/config/log4j2.properties" -cp 'lib/*' client.JFiltraClient config/client.properties > "source-ro-$attempt.log" 2>&1)
   check "move/source read-only: run $attempt exits 3, no append" [ "$?" = 3 -a ! -e "$WORK/received/parallel/a-source-ro.txt" -a ! -e "$WORK/received/parallel/b-source-ro.txt" ]
-  check "move/source read-only: run $attempt logs source once, skips its other file" [ "$(count "ERROR.*Cannot send .*not a writable directory: $WORK/src6$" "$WORK/client6/source-ro-$attempt.log")" = 1 ]
+  check "move/source read-only: run $attempt logs source once, skips its other file" [ "$(count "ERROR.*Cannot send .*not a writable directory (needs write and execute permission): $WORK/src6$" "$WORK/client6/source-ro-$attempt.log")" = 1 ]
 done
 chmod 755 "$WORK/src6"
 # G2: a blocked source directory must not starve a different writable directory.
@@ -758,7 +792,7 @@ for action in delete move; do
   (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile="$WORK/client6/config/log4j2.properties" -cp 'lib/*' client.JFiltraClient config/client.properties > "multi-$action.log" 2>&1)
   check "$action: once skips blocked directory and succeeds from second directory" [ "$?" = 0 -a ! -e "$WORK/src7/z-writable-$action.txt" ]
   check "$action: blocked files never uploaded" [ ! -e "$WORK/received/parallel/a-blocked-$action.txt" -a ! -e "$WORK/received/parallel/b-blocked-$action.txt" ]
-  check "$action: only one pre-check error for blocked directory" [ "$(count "ERROR.*Cannot send .*not a writable directory: $WORK/src6$" "$WORK/client6/multi-$action.log")" = 1 ]
+  check "$action: only one pre-check error for blocked directory" [ "$(count "ERROR.*Cannot send .*not a writable directory (needs write and execute permission): $WORK/src6$" "$WORK/client6/multi-$action.log")" = 1 ]
   (cd "$WORK/client6" && "$JAVA" -Dlog4j2.configurationFile="$WORK/client6/config/log4j2.properties" -cp 'lib/*' client.JFiltraClient config/client.properties > "multi-again-$action.log" 2>&1)
   check "$action: no remaining deliverable files exits 3" [ "$?" = 3 ]
   check "$action: second directory file appended exactly once" cmp -s "$WORK/received/parallel/z-writable-$action.txt" <(echo delivered)
@@ -775,10 +809,10 @@ chmod 755 "$WORK/src6"; rm "$WORK/src6/missing.txt"
 write_client_config "$WORK/client6" parallel "$WORK/src6" "$KEYP" "$MODE_PORT"
 echo "line" > "$WORK/src6/log.txt" && chmod 555 "$WORK/src6"
 start "$WORK/client6" client.JFiltraClient client.properties jfiltra-client.jar
-wait_for 15 grep -q "Cannot send log.txt: not a writable directory:" "$WORK/client6/logs/client_jfiltra.log"
+wait_for 15 grep -q "Cannot send log.txt: not a writable directory (needs write and execute permission):" "$WORK/client6/logs/client_jfiltra.log"
 sleep 8
 check "unwritable source is not uploaded" [ ! -e "$WORK/received/parallel/log.txt" ]
-check "unwritable source reported before sending" grep -q "Cannot send log.txt: not a writable directory:" "$WORK/client6/logs/client_jfiltra.log"
+check "unwritable source reported before sending" grep -q "Cannot send log.txt: not a writable directory (needs write and execute permission):" "$WORK/client6/logs/client_jfiltra.log"
 chmod 755 "$WORK/src6"
 check "file deleted once the directory is writable" wait_for 20 [ ! -e "$WORK/src6/log.txt" ]
 check "still appended only once" cmp -s "$WORK/received/parallel/log.txt" <(echo "line")

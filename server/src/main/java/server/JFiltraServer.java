@@ -71,7 +71,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraServer {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.1.10";
+    private static final String VERSION = "1.1.11";
     
     // Logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraServer.class);
