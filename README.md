@@ -192,33 +192,66 @@ version (modification time and size); the last good copy stays active.
 | `file.order`               | No       | Order in which files are sent: `time` (default, oldest first), `size` (smallest first) or `name` (A to Z); a leading `!` reverses it, e.g. `!time`. See [File order](#file-order) |
 | `after.send`               | No       | What happens to a file after the server stored it: `delete` (default) or `move` to `sent/` inside its source directory. See [How transfers behave](#how-transfers-behave) |
 | `filemask`                 | No       | File name masks of the files to send, separated by `,` or `;` (default `*`: all files). See [File mask](#file-mask) |
-| `ignore.patterns`          | No       | Comma-separated file name patterns that are never sent, not case-sensitive (default `.*,*.part,*.tmp,*.crdownload,~$*`; empty sends everything) |
-
-`ignore.patterns` is split on every comma, including the comma in `{a,b}`;
-brace alternatives containing commas are not supported. Use separate patterns instead.
-Raw backslashes in `ignore.patterns` (as in `filemask`) are refused at startup.
+| `ignore.patterns`          | No       | Comma-separated file name patterns that are never sent, not case-sensitive (default `.*,*.part,*.tmp,*.crdownload,~$*`; empty sends everything). See [File mask](#file-mask) |
 
 ### File mask
 
-`filemask` limits which files the client sends. Example:
+Two settings decide which files in a source directory are sent:
+
+- `filemask` lists the files to send. The default `*` means all files.
+- `ignore.patterns` lists the files never to send. By default these are hidden
+  files (starting with `.`), files ending in `.part`, `.tmp` or `.crdownload`, and
+  Office lock files (starting with `~$`).
+
+A file is sent only if it matches `filemask` **and** no ignore pattern. Only
+regular files are considered: subdirectories and symbolic links are never sent.
+With `after.send=move`, a file named `sent` is never sent either. Files that are
+not sent stay in the source directory untouched; the client logs them at debug
+level only.
+
+Example:
 
 ```properties
 # Send only CSV files and files like report_01.txt
 filemask=*.csv; report_??.txt
+# Never send backup files (this replaces the default list, so repeat what you need)
+ignore.patterns=.*,*.part,*.tmp,*.crdownload,~$*,*.bak
 ```
 
+With these settings `data.csv`, `DATA.CSV` and `report_01.txt` are sent.
+`report_1.txt` and `notes.txt` are not sent because no mask matches them, and
+`.data.csv` is not sent because hidden files are ignored.
+
+**`filemask`**
+
+- Masks are separated by `,` or `;`. Spaces around a mask are ignored.
 - `*` matches any number of characters (also none), `?` exactly one character.
-  All other characters match themselves; there are no regular expressions.
-- Masks match the file name only, not the directory. A mask with `/` or `\`
+  All other characters, including `[`, `]`, `{` and `}`, match only themselves.
+  There are no regular expressions.
+- A file is sent if it matches any of the masks.
+- An empty value or `*` allows all files, but `ignore.patterns` still applies.
+- Masks match the file name only, not the directory. A mask containing `/`, `\`
+  or a control character is refused at startup with a clear error.
+
+**`ignore.patterns`**
+
+- Patterns are separated by commas only (`;` is not a separator here).
+- They use Java glob syntax: `*` and `?` as above, plus `[abc]` (one of these
+  characters), `[a-z]` (a range) and `{a,b}` (alternatives). Because every comma
+  separates two patterns, even inside `{a,b}`, write alternatives as separate
+  patterns instead: `*.bak,*.old`, not `*.{bak,old}`.
+- Your value replaces the default list completely. An empty value
+  (`ignore.patterns=`) ignores nothing, so hidden and `.part` files are then
+  sent too.
+- A pattern that is not valid glob syntax, or a backslash anywhere in the value,
   is refused at startup with a clear error.
+
+**Both settings**
+
 - Matching ignores upper and lower case on every operating system:
   `*.csv` also matches `DATA.CSV`.
-- A file is sent if it matches any of the masks. An empty value or `*` sends
-  all files, as without the setting.
-- `ignore.patterns` still applies: a file matching it is never sent, even if it
-  matches `filemask`.
-- Files that don't match stay in the source directory untouched. The client
-  logs them at debug level only.
+- `ignore.patterns` wins: a file matching an ignore pattern is never sent, even
+  if it matches `filemask`.
 
 ### File order
 
