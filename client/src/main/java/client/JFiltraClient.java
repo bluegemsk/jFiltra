@@ -41,7 +41,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraClient {
     // jFiltra release version, shown at startup
-    private static final String VERSION = "1.1.11";
+    private static final String VERSION = "1.1.12";
     
     // Initialize logger for application logging
     private static final Logger logger = LogManager.getLogger(JFiltraClient.class);
@@ -986,15 +986,13 @@ public class JFiltraClient {
             deliveredFiles.remove(filePath);
             return true;
         } catch (IOException e) {
+            // The server's conflict mode is not part of the protocol; the append warning is conditional.
             logger.error("File " + fileName + " was delivered but can't be " + (moveToSent ? "moved to sent/" : "deleted")
-                    + (runOnce ? " (restore permissions before the next run): " : " (it is not sent again): ") + e);
+                    + (runOnce ? ": fix permissions and remove or move it before running again"
+                            + " (if the server uses append, running again would store it twice; see README): "
+                            : " (it is not sent again): ") + e);
             deliveredFiles.put(filePath, snapshot);
-            if (runOnce) {
-                // The server's conflict mode is not part of the protocol; the append warning is conditional.
-                logger.warn(fileName + " was delivered but could not be " + (moveToSent ? "moved" : "removed")
-                        + "; fix permissions and remove or move it before running again"
-                        + " (if the server uses append, running again would store it twice; see README)");
-            } else {
+            if (!runOnce) {
                 scheduleRetry(filePath, snapshot, fileName);
             }
             return false;

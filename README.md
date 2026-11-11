@@ -2,15 +2,15 @@
 
 jFiltra is a lightweight Java client/server tool for moving files from watched
 directories to a central server, reliably and with as little setup as possible.
-Current version: **1.1.11** (server, client and DB client share the version).
+Current version: **1.1.12** (server, client and DB client share the version).
 
 ## Status
 
-1.1.11 (November 2026) addresses Q1 from the 1.1.10 product test and clarifies post-delivery cleanup failures.
+1.1.12 (November 2026) addresses cosmetic finding M1 from the 1.1.11 product test.
 No known open bugs remain in the tested scenarios:
 
 - Bundled suites pass on Temurin 21.0.12.1 and Temurin 1.8.0_504: the file client and server smoke test
-  (269 checks), the DB client smoke test against PostgreSQL
+  (274 checks), the DB client smoke test against PostgreSQL
   (131 checks) and MariaDB (122 with the MariaDB driver, 125 with MySQL Connector/J,
   and 122 with Connector/J cursor fetching), and the Java version script test
   (48 cases, included in each file smoke run). Permission-based checks run as a
@@ -19,6 +19,10 @@ No known open bugs remain in the tested scenarios:
 - Earlier product test on Java 8: 300 files from two source directories with `after.send=move`,
   port probes and a key file change during the run. All files arrived intact, with
   no warnings or errors.
+- Changes in 1.1.12:
+  - Once-mode cleanup failures after delivery are reported on one ERROR line with
+    the full manual-cleanup advice, conditional append warning and operating-system
+    reason. There is no separate WARN advice; loop-mode logging is unchanged.
 - Changes in 1.1.11:
   - Writable source and archive directories must also have execute/search permission.
     A `sent/` directory without execute permission blocks the source folder before
@@ -327,8 +331,9 @@ client/script/start-client.sh; echo "exit code $?"
   during transfer), once mode stops immediately with exit 3, without sending any
   further files. Fix the permissions and remove or move the already-delivered file
   from the outbox before running again, especially with append. The log points to
-  this rule instead of promising a retry; since the client does not know the
-  server's conflict mode, its append warning is conditional.
+  this rule on the same ERROR line as the failure and operating-system reason,
+  instead of a separate WARN or a promised retry. Since the client does not know
+  the server's conflict mode, its append warning is conditional.
 - The value is not case-sensitive. An invalid `run.mode` or `file.order` stops
   the client with exit code 1.
 

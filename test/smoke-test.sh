@@ -120,7 +120,13 @@ if "$JAVAC" -nowarn -source 8 -target 8 -cp "$ROOT/client/lib/*" -d "$WORK/unit"
   mkdir -p "$WORK/after-send-test"
   "$JAVA" -Dlog4j2.configurationFile="$ROOT/client/config/log4j2.properties" -cp "$WORK/unit:$ROOT/client/lib/*" client.AfterSendTest "$WORK/after-send-test" > "$WORK/after-send-test.log" 2>&1
   check "cleanup permission races: delete/move, once stops and loop retries cleanup only" [ "$?" = 0 ]
-  check "once cleanup failure: delete/move both explain manual cleanup and conditional append risk" [ "$(count 'a.txt was delivered but could not be .*fix permissions and remove or move it before running again (if the server uses append, running again would store it twice; see README)' "$WORK/after-send-test.log")" = 2 ]
+  for action in deleted 'moved to sent/'; do
+    check "once cleanup failure: $action has one ERROR with complete advice and OS reason" [ "$(count "ERROR.*File a.txt was delivered but can't be $action: fix permissions and remove or move it before running again (if the server uses append, running again would store it twice; see README): java.nio.file.AccessDeniedException:" "$WORK/after-send-test.log")" = 1 ]
+  done
+  check "once cleanup failure: no separate WARN advice" bash -c '! grep -q "WARN.*a.txt was delivered" "$1"' _ "$WORK/after-send-test.log"
+  check "once cleanup failure: no outdated restore-only advice" bash -c '! grep -q "restore permissions before the next run" "$1"' _ "$WORK/after-send-test.log"
+  check "cleanup failure: exactly one ERROR per delete/move case in each mode" [ "$(count "ERROR.*File a.txt was delivered but can't be" "$WORK/after-send-test.log")" = 4 ]
+  check "loop cleanup failure: existing ERROR wording retained" [ "$(count "ERROR.*File a.txt was delivered but can't be .* (it is not sent again): java.nio.file.AccessDeniedException:" "$WORK/after-send-test.log")" = 2 ]
   check "once cleanup failure: no invitation to resend on the next run" bash -c '! grep -q "Will retry a.txt on the next run" "$1"' _ "$WORK/after-send-test.log"
   check "loop cleanup failure: existing timed retry wording retained" [ "$(count 'Will retry a.txt in' "$WORK/after-send-test.log")" = 2 ]
 else

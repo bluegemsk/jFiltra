@@ -52,7 +52,7 @@ import org.apache.logging.log4j.Logger;
  */
 public class JFiltraDbClient {
 
-    private static final String VERSION = "1.1.11";
+    private static final String VERSION = "1.1.12";
 
     private static final Logger logger = LogManager.getLogger(JFiltraDbClient.class);
 
