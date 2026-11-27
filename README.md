@@ -1,7 +1,8 @@
 # jFiltra
 
-jFiltra is a lightweight Java client/server tool for moving files from watched
-directories to a central server, reliably and with as little setup as possible.
+jFiltra is a lightweight self-hosted command line Java client/server tool for 
+moving files from watched directories to a central server, reliably
+and with as little setup as possible.
 Current version: **1.1.12** (server, client and DB client share the version).
 Test status and change history: [STATUS.md](STATUS.md).
 
