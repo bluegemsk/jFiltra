@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/jfiltra-icon.png" alt="jFiltra icon" width="96" height="96">
+</p>
+
 # jFiltra
 
 jFiltra is a lightweight self-hosted command line Java client/server tool for 
