@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/jFiltra_banner.png" alt="jFiltra icon" width="1280" height="640">
+  <img src="docs/assets/jFiltra_banner.png" alt="jFiltra icon" width="640" height="320">
 </p>
 
 # jFiltra
