@@ -1,12 +1,5 @@
 # jFiltra
 
-jFiltra is source-available, **not** open source. Noncommercial use is free under the
-[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
-Commercial use requires a license from BLUEGEM.
-
-For the commercial product (dashboard, tamper-evident logs, MFA/SSO, SIEM export,
-hybrid post-quantum key exchange, and signed releases), see [Emona MFT](https://emonamft.com).
-
 jFiltra is a lightweight self-hosted command line Java client/server tool for 
 moving files from watched directories to a central server, reliably
 and with as little setup as possible.
@@ -27,6 +20,14 @@ Test status and change history: [STATUS.md](STATUS.md).
 
 jFiltra does not encrypt the connection. Use it on a trusted network, or through
 a VPN or SSH tunnel; see [Security notes](#security-notes).
+
+jFiltra is source-available, **not** open source. Noncommercial use is free under the
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
+Commercial use requires a license from BLUEGEM.
+
+For the commercial product (dashboard, tamper-evident logs, MFA/SSO, SIEM export,
+hybrid post-quantum key exchange, and signed releases), see [Emona MFT](https://emonamft.com).
+
 
 ## Requirements
 
